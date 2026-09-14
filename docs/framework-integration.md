@@ -89,11 +89,24 @@ A contract's `status` goes `pending` → `completed`; once completed, `signed_pd
 GET /api/contracts/:id/audit
 → [{ "event_type": "contract.created|contract.opened|document.viewed|identity.challenged|identity.verified|contract.completed|contract.copy_sent|...", "actor": "system|signer|admin", "created_at": "...", "prev_hash": "...", "hash": "...", ... }]
 
-GET /api/contracts/:id/verify     # re-hash the stored signed PDF vs the SHA-256 sealed at signing → { ok: true }
-GET /api/audit/verify             # walk the tamper-evident audit hash chain → { ok: true, eventCount: N }
-POST /api/contracts/:id/extend    # { "days": 30 } — fresh expiry window for a pending contract
-POST /api/contracts/:id/resend    # re-send the signing email (pending, unexpired only)
+GET /api/contracts/:id/evidence  # COMPLETE evidence bundle for patient-file archiving (see below)
+GET /api/contracts/:id/verify    # re-hash the stored signed PDF vs the SHA-256 sealed at signing → { ok: true }
+GET /api/audit/verify            # walk the tamper-evident audit hash chain → { ok: true, eventCount: N }
+POST /api/contracts/:id/extend   # { "days": 30 } — fresh expiry window for a pending contract
+POST /api/contracts/:id/resend   # re-send the signing email (pending, unexpired only)
 ```
+
+### Evidence bundle (`GET /api/contracts/:id/evidence`)
+
+One call returns everything a clinic app needs to archive the signing evidence on the patient record, independently of the Contracts server:
+
+- `contract` — the full contract record (signing token redacted), with `signed_pdf_sha256` / `content_sha256` seals, timestamps, expiry
+- `template` — id/name/status snapshot
+- `consent` — the verbatim consent statement + version the signer accepted
+- `auditEvents` — the contract's full audit trail in chain order, with `prev_hash`/`hash` per event
+- `chain` — global chain status at export time (`verified`, `eventCount`, `headHash`)
+- `pdf` — the signed PDF itself (`base64`), its SHA-256, and whether it matches the completion seal (`matchesSeal`); omit with `?includePdf=false`
+- `bundleSha256` — sha256 over the compact JSON serialization of everything above (the object without this field). Verify a stored copy with `sha256(Buffer.from(JSON.stringify(bundleWithoutSha)))` (Node; other languages: compact separators, no whitespace, key order as received)
 
 On completion the contract row also carries `signed_pdf_sha256` and `content_sha256`, the signed PDF's certificate page records consent + signer IP + the content hash, and the signer is emailed a copy of the signed PDF.
 
@@ -127,6 +140,7 @@ CONTRACTS_TEMPLATES = {
 3. Contracts app creates the contract (`status: pending`), pre-fills mapped fields, emails the signer via Resend.
 4. Signer opens `signingUrl`, verifies their email with a 6-digit code, views the document, ticks the consent statement, fills signature/date, submits → app stamps the PDF (with signing certificate + SHA-256 seals), sets `status: completed`, stores `signed_pdf_path`, and emails the signer their copy.
 5. Framework shows status (poll or fetch on view) and links the signed PDF once completed.
+6. On completion, the Framework **archives the evidence bundle on the patient file** (`GET /api/contracts/:id/evidence`): the signed PDF and the audit/hashes/consent bundle are stored as patient documents, with the seals (`bundleSha256`, `signedPdfSha256`) recorded on the signing request. The evidence then lives with the patient record, not only on the Contracts server.
 
 ## 6. What to build
 
@@ -134,7 +148,8 @@ CONTRACTS_TEMPLATES = {
 2. **Server-side client module** (one helper per endpoint in §3). Keep it small; it's just `fetch` + bearer header + JSON.
 3. **Patient record UI:** a *Send contract* action that gathers payer name/email (+ patient name/age) and calls create. Show a status badge (`pending` / `completed`) and, when completed, a link to the signed PDF.
 4. **Status sync:** fetch the contract by `id` (filter your local table by `patient_record_id`) when the record is viewed, or a periodic poll. (Webhooks are a future enhancement — not available yet.)
-5. **Error handling:** surface email-send failures (`email.sent: false`) to staff so they can use the returned `signingUrl` manually.
+5. **Evidence archiving:** when a contract completes, pull `GET /api/contracts/:id/evidence` and store the signed PDF + evidence JSON on the patient file, recording `bundleSha256` and `signedPdfSha256` locally. Verify the bundle seal (`sha256` over the compact JSON of the bundle without `bundleSha256`) before trusting the copy. (The Cardinal Framework does this automatically in its refresh flow.)
+6. **Error handling:** surface email-send failures (`email.sent: false`) to staff so they can use the returned `signingUrl` manually.
 
 ## 7. Worked example (run from the Framework host)
 

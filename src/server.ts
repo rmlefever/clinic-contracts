@@ -438,6 +438,58 @@ app.get('/api/audit/verify', async (request) => {
   return verifyAuditChain();
 });
 
+/**
+ * Complete, self-contained evidence bundle for one contract — what clinic apps
+ * archive on the patient file so the evidence survives independently of this
+ * server. Includes the contract record, consent statement, the full audit
+ * trail (with chain hashes), the global chain head at export time, and the
+ * signed PDF itself (base64) with its verified SHA-256. `bundleSha256` seals
+ * the whole export: sha256(JSON.stringify(bundle without that field)).
+ */
+app.get('/api/contracts/:id/evidence', async (request) => {
+  requireAdmin(request);
+  const id = (request.params as { id: string }).id;
+  const contract = db.prepare('SELECT * FROM contracts WHERE id = ?').get(id) as ContractRecord | undefined;
+  if (!contract) throw Object.assign(new Error('Contract not found'), { statusCode: 404 });
+  const includePdf = (request.query as { includePdf?: string }).includePdf !== 'false';
+
+  const template = db.prepare('SELECT id, name, status FROM templates WHERE id = ?').get(contract.template_id) as { id: string; name: string; status: string };
+  // rowid = insertion order = chain order; created_at alone can tie within a millisecond.
+  const auditEvents = db.prepare('SELECT * FROM audit_events WHERE contract_id = ? ORDER BY rowid ASC').all(id);
+  const chain = verifyAuditChain();
+  const headHash = (db.prepare('SELECT hash FROM audit_events ORDER BY rowid DESC LIMIT 1').get() as { hash: string | null } | undefined)?.hash ?? null;
+
+  let pdf: { included: boolean; sha256: string | null; matchesSeal: boolean | null; base64: string | null } = { included: false, sha256: null, matchesSeal: null, base64: null };
+  if (contract.signed_pdf_path && includePdf) {
+    try {
+      const bytes = await fsp.readFile(contract.signed_pdf_path);
+      const actual = createHash('sha256').update(bytes).digest('hex');
+      pdf = {
+        included: true,
+        sha256: actual,
+        matchesSeal: contract.signed_pdf_sha256 ? actual === contract.signed_pdf_sha256 : null,
+        base64: Buffer.from(bytes).toString('base64')
+      };
+    } catch {
+      pdf = { included: true, sha256: null, matchesSeal: false, base64: null };
+    }
+  }
+
+  const { signing_token: _redacted, ...contractRecord } = contract;
+  const bundle = {
+    format: 'cardinal-contracts-evidence/1',
+    exportedAt: new Date().toISOString(),
+    contract: contractRecord,
+    template,
+    consent: { text: CONSENT_STATEMENT, version: CONSENT_VERSION },
+    auditEvents,
+    chain: { verified: chain.ok, eventCount: chain.eventCount, headHash },
+    pdf
+  };
+  const bundleSha256 = createHash('sha256').update(JSON.stringify(bundle)).digest('hex');
+  return { ...bundle, bundleSha256 };
+});
+
 /** Give a pending contract a fresh expiry window (e.g. the link expired and the payer still needs to sign). */
 app.post('/api/contracts/:id/extend', async (request) => {
   requireAdmin(request);
