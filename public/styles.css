@@ -238,6 +238,19 @@ label {
   touch-action: none;
 }
 
+.consent {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 12px;
+  background: white;
+  font-size: 14px;
+}
+
+.consent input { margin-top: 3px; }
+
 @media (max-width: 900px) {
   .shell, .designer, .sign-layout { grid-template-columns: 1fr; }
   .form-grid, .toolbar { grid-template-columns: 1fr; }

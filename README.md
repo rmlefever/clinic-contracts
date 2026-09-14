@@ -2,6 +2,8 @@
 
 Self-hosted contract sending and signing layer for clinics. It provides the Pro-style workflow we wanted: template upload, visual field placement, one-click sending, signer emails, status tracking, signed PDF generation, and audit logs.
 
+Signing evidence is built in: signers verify by emailed one-time code and accept a recorded consent statement before signing; links expire; the signed PDF carries a signing certificate page (signer identity, IP, timestamps, consent, document SHA-256); the audit log is hash-chained (tamper-evident) and archived — not destroyed — when a contract is permanently deleted; and signers automatically receive a copy of the completed PDF by email.
+
 ## Documentation
 
 - [Technical overview](docs/technical-overview.md): architecture, feature behaviour, API flows, database relationships, [access control](docs/technical-overview.md#access-control), technical debt, and deployment assumptions.

@@ -4,8 +4,16 @@ const message = document.getElementById('message');
 const signer = document.getElementById('signer');
 const form = document.getElementById('signForm');
 const pdfFrame = document.getElementById('pdfFrame');
+const otpStep = document.getElementById('otpStep');
+const otpIntro = document.getElementById('otpIntro');
+const otpSendControls = document.getElementById('otpSendControls');
+const otpVerifyControls = document.getElementById('otpVerifyControls');
+const otpCodeInput = document.getElementById('otpCode');
+const otpSend = document.getElementById('otpSend');
+const otpVerify = document.getElementById('otpVerify');
+const otpResend = document.getElementById('otpResend');
 
-const state = { payload: null, values: {} };
+const state = { payload: null, values: {}, viewedPinged: false };
 
 async function load() {
   const res = await fetch(`/api/sign/${token}`);
@@ -13,10 +21,84 @@ async function load() {
   if (!res.ok) throw new Error(payload.message || payload.error || 'Contract not found');
   state.payload = payload;
   state.values = payload.values || {};
-  pdfFrame.src = `/uploads/${payload.template.pdf_path.split('/').pop()}`;
+  if (payload.identity.required && !payload.identity.verified) return renderOtpStep();
+  renderSigningForm();
+}
+
+// --- Email verification step -------------------------------------------------
+
+function renderOtpStep() {
   message.classList.add('hidden');
+  signer.classList.add('hidden');
+  otpStep.classList.remove('hidden');
+  otpIntro.textContent = `For security, we email a verification code to ${state.payload.identity.emailMasked} before you can sign.`;
+  otpSendControls.classList.remove('hidden');
+  otpVerifyControls.classList.add('hidden');
+}
+
+async function requestOtp() {
+  otpSend.disabled = true;
+  otpResend.disabled = true;
+  try {
+    const res = await fetch(`/api/sign/${token}/otp`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const body = await res.json();
+    if (!res.ok) return alert(body.message || body.error || 'Unable to send code');
+    if (body.sent === false) return alert(`Could not send the email: ${body.reason || 'email provider not configured'}. Please contact the clinic.`);
+    otpSendControls.classList.add('hidden');
+    otpVerifyControls.classList.remove('hidden');
+    otpCodeInput.focus();
+  } finally {
+    otpSend.disabled = false;
+    otpResend.disabled = false;
+  }
+}
+
+async function verifyOtp() {
+  const code = otpCodeInput.value.trim();
+  if (!/^\d{6}$/.test(code)) return alert('Enter the 6-digit code from your email.');
+  otpVerify.disabled = true;
+  try {
+    const res = await fetch(`/api/sign/${token}/otp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code })
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      alert(body.message || body.error || 'Verification failed');
+      if (String(body.message || '').includes('expired') || String(body.message || '').includes('attempts')) {
+        otpCodeInput.value = '';
+        otpSendControls.classList.remove('hidden');
+        otpVerifyControls.classList.add('hidden');
+      }
+      return;
+    }
+    otpStep.classList.add('hidden');
+    renderSigningForm();
+  } finally {
+    otpVerify.disabled = false;
+  }
+}
+
+otpSend.addEventListener('click', requestOtp);
+otpResend.addEventListener('click', requestOtp);
+otpVerify.addEventListener('click', verifyOtp);
+otpCodeInput.addEventListener('keydown', (event) => { if (event.key === 'Enter') verifyOtp(); });
+
+// --- Signing form ------------------------------------------------------------
+
+function renderSigningForm() {
+  message.classList.add('hidden');
+  otpStep.classList.add('hidden');
   signer.classList.remove('hidden');
   renderForm();
+  // Evidence: record that the signer actually viewed the document (once).
+  pdfFrame.onload = () => {
+    if (state.viewedPinged) return;
+    state.viewedPinged = true;
+    fetch(`/api/sign/${token}/viewed`, { method: 'POST' }).catch(() => {});
+  };
+  pdfFrame.src = `/uploads/${state.payload.template.pdf_path.split('/').pop()}`;
 }
 
 function renderForm() {
@@ -24,6 +106,7 @@ function renderForm() {
   form.innerHTML = `
     <h2>${state.payload.contract.patient_name}</h2>
     ${fields.map((field) => fieldHtml(field)).join('')}
+    <label class="consent"><input type="checkbox" id="consentCheck" required> ${state.payload.consent.text}</label>
     <button type="submit">Complete Signing</button>
   `;
   fields.filter((field) => field.type === 'signature').forEach(setupSignature);
@@ -94,13 +177,17 @@ form.addEventListener('submit', async (event) => {
   const res = await fetch(`/api/sign/${token}/complete`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ values })
+    body: JSON.stringify({ values, consentAccepted: document.getElementById('consentCheck').checked })
   });
   const body = await res.json();
-  if (!res.ok) return alert(body.message || body.error || 'Unable to complete signing');
+  if (!res.ok) {
+    if (res.status === 403) { renderOtpStep(); return; }
+    return alert(body.message || body.error || 'Unable to complete signing');
+  }
   signer.classList.add('hidden');
+  otpStep.classList.add('hidden');
   message.classList.remove('hidden');
-  message.innerHTML = `<strong>Signed.</strong><br>The completed PDF has been stored.`;
+  message.innerHTML = `<strong>Signed.</strong><br>The completed PDF has been stored.${body.copySent ? '<br>A copy has been emailed to you for your records.' : ''}`;
 });
 
 function escapeAttr(value) {

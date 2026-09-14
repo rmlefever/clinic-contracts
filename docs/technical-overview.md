@@ -9,8 +9,9 @@ Cardinal Contracts is a single Fastify application written in TypeScript.
 - `src/server.ts` owns the HTTP server, route registration, request validation, static file serving, and workflow orchestration.
 - `src/db.ts` opens the SQLite database with `better-sqlite3`, enables WAL mode and foreign keys, creates tables, inserts the default clinics, and exposes record types plus `fieldsFor()`.
 - `src/pdf.ts` generates completed PDFs by stamping values and signature images onto the original template PDF with `pdf-lib`, then appending a signing certificate page.
-- `src/email.ts` sends signing links through Resend when `RESEND_API_KEY` is configured.
-- `src/audit.ts` writes audit events to SQLite.
+- `src/email.ts` sends signing links, signer identity-verification codes, and completed-PDF copies through Resend when `RESEND_API_KEY` is configured.
+- `src/audit.ts` writes hash-chained audit events to SQLite (`hash = sha256(prev_hash + canonical_event_json)`), verifies the chain, and archives a contract's trail before permanent deletion.
+- `src/otp.ts` holds the pure helpers for signer email verification: code generation, HMAC hashing, constant-time comparison, and email masking.
 - `public/index.html` and `public/main.js` implement the admin UI for clinics, templates, sending, and contract management.
 - `public/sign.html` and `public/sign.js` implement the public signer flow.
 
@@ -62,23 +63,40 @@ If `RESEND_API_KEY` is present, the application sends the signer an email throug
 
 ### Signing
 
-The public signer flow loads contract data with `GET /api/sign/:token`. Archived contracts return HTTP 410. The route writes a `contract.opened` audit event every time it is called.
+The public signer flow loads contract data with `GET /api/sign/:token`. Archived or expired contracts return HTTP 410. The route writes a `contract.opened` audit event every time it is called. The response also tells the signer UI whether email verification is required (`identity.required`), whether the current browser session has passed it (`identity.verified`), and carries the canonical consent statement and version presented at signing.
 
-The signer submits values to `POST /api/sign/:token/complete`. The server rejects archived contracts, already completed contracts, and submissions missing required fields. On success it:
+**Link expiry.** Contracts carry `expires_at` (default 30 days, `SIGNING_TOKEN_DAYS`). An expired pending contract returns 410 with a `contract.expired` audit event (written once); admins can extend (`POST /api/contracts/:id/extend`) or re-send (`POST /api/contracts/:id/resend`) the link.
+
+**Signer identity verification (email OTP).** When `RESEND_API_KEY` is configured (and `SIGNER_OTP_ENABLED` is not `false`), the signer must verify before completing:
+
+1. `POST /api/sign/:token/otp` (no body) emails a 6-digit code to the payer address. Only an HMAC of the code is stored (keyed by `ADMIN_TOKEN`), with a 10-minute expiry, 5-attempt limit, and a 30-second resend throttle. Audit: `identity.challenged`.
+2. `POST /api/sign/:token/otp` with `{ code }` verifies (constant-time), grants an httpOnly session cookie (2 hours, `signer_sessions` table) scoped to the contract. Audit: `identity.verified` (with IP/UA).
+3. `POST /api/sign/:token/complete` rejects unverified signers with 403 `identity_required`.
+
+Without an email provider the step is skipped and completions are recorded with `identityMethod: unverified` — the same degradation the signing email itself has.
+
+**Document viewing.** `POST /api/sign/:token/viewed` records a one-time `document.viewed` audit event when the signer UI renders the PDF — evidence the signer saw the document, not just the form.
+
+The signer submits values to `POST /api/sign/:token/complete`. The body must include `consentAccepted: true` alongside the field values; the server rejects submissions missing required fields, missing consent, archived/expired contracts, and already completed contracts. On success it:
 
 1. Upserts submitted values into `contract_values`.
-2. Generates a signed PDF in `STORAGE_DIR`.
-3. Sets contract status to `completed`.
-4. Stores `signed_pdf_path` and `completed_at`.
-5. Writes a `contract.completed` audit event.
+2. Generates a signed PDF in `STORAGE_DIR`: values and signature images stamped onto the template, then a **signing certificate page** appended containing the contract ID, patient record, signer name/email, signer IP at completion, document first-viewed timestamp, completion timestamp, the verbatim consent statement (with version), and the SHA-256 of the document content pages (excluding the certificate itself).
+3. Computes and stores two seals on the contract row: `content_sha256` (pages before the certificate) and `signed_pdf_sha256` (the complete stored file). `GET /api/contracts/:id/verify` re-hashes the stored file against `signed_pdf_sha256` at any time.
+4. Sets contract status to `completed` with `completed_at`.
+5. Writes a `contract.completed` audit event whose data records the consent statement/version, both hashes, and the identity method (`email-otp` or `unverified`).
+6. Emails the signer a copy of the completed PDF (when Resend is configured), recording `contract.copy_sent`.
 
-The signer UI embeds the original uploaded PDF beside the generated form. The completed PDF is not shown to the signer by the current UI after signing; the admin dashboard links to it when `signed_pdf_path` exists.
+The signer UI embeds the original uploaded PDF beside the generated form. The completed PDF is not shown to the signer in the browser after signing (their copy arrives by email); the admin dashboard links to it when `signed_pdf_path` exists.
+
+### Audit Log Integrity
+
+Every audit event is chained: `hash = sha256(prev_hash + canonical_json(event))` across all events in insertion order. `GET /api/audit/verify` walks the chain and reports the first inconsistency, making retroactive edits or deletions detectable. (Truncation of the chain's tail is not detectable from inside the table — the off-host daily backups provide that half of the guarantee.) The canonical JSON key order is fixed forever: reordering keys would invalidate every existing hash.
 
 ### Archive And Removal
 
 Admin contract listing defaults to active contracts (`archived_at IS NULL`). Passing `archived=true` lists archived contracts.
 
-Archiving sets `archived_at` and blocks future signer access. Restoring clears `archived_at`. Permanent deletion is only allowed after archiving; deletion removes the contract row and, when present, the signed PDF file. Related field values and audit events are removed by `ON DELETE CASCADE`.
+Archiving sets `archived_at` and blocks future signer access. Restoring clears `archived_at`. Permanent deletion is only allowed after archiving. Before the contract row is deleted, a terminal `contract.deleted` audit event is written containing a snapshot of the contract record and its field values, and the contract's entire audit trail (with hash-chain values intact) is copied to `audit_events_archive` — the evidence outlives the contract. Deletion then removes the contract row, its remaining live events, values, challenges and sessions (cascade), and, when present, the signed PDF file.
 
 ## API Flows
 
@@ -109,18 +127,23 @@ The configured token defaults to `change-me` when `ADMIN_TOKEN` is not set.
 
 ### Signer Completion Flow
 
-1. `GET /api/sign/:token`
-2. Signer fills fields in `public/sign.js`.
-3. `POST /api/sign/:token/complete`
-4. Server writes values, stamps the PDF, completes the contract, and records audit evidence.
+1. `GET /api/sign/:token` — contract data, identity requirement, consent statement
+2. If `identity.required` and not verified: `POST /api/sign/:token/otp` (send code, then verify code) — session cookie granted
+3. `POST /api/sign/:token/viewed` (UI fires once when the PDF renders)
+4. Signer fills fields and checks the consent box in `public/sign.js`
+5. `POST /api/sign/:token/complete` with `{ values, consentAccepted: true }`
+6. Server writes values, stamps the PDF with certificate + hashes, completes the contract, emails the signer their copy, and records audit evidence.
 
 ### Contract Operations Flow
 
 1. `GET /api/contracts?clinicId=<clinic-id>&archived=false`
-2. `POST /api/contracts/:id/archive`
-3. `GET /api/contracts?clinicId=<clinic-id>&archived=true`
-4. `POST /api/contracts/:id/restore` or `DELETE /api/contracts/:id`
-5. `GET /api/contracts/:id/audit`
+2. `POST /api/contracts/:id/resend` or `POST /api/contracts/:id/extend` (pending only — re-send the link, give it a fresh expiry window)
+3. `POST /api/contracts/:id/archive`
+4. `GET /api/contracts?clinicId=<clinic-id>&archived=true`
+5. `POST /api/contracts/:id/restore` or `DELETE /api/contracts/:id` (audit trail is archived first)
+6. `GET /api/contracts/:id/audit` — full event trail with chain hashes
+7. `GET /api/contracts/:id/verify` — re-hash the stored signed PDF against the sealed SHA-256
+8. `GET /api/audit/verify` — walk the whole audit hash chain
 
 ## Database Relationships
 
@@ -184,6 +207,8 @@ erDiagram
     text ip
     text user_agent
     text data_json
+    text prev_hash
+    text hash
     text created_at
   }
 ```
@@ -192,7 +217,8 @@ Relationship details:
 
 - `templates.clinic_id`, `contracts.clinic_id`, and `contracts.template_id` are foreign keys without cascade delete.
 - `contract_values.contract_id` cascades when a contract is deleted.
-- `audit_events.contract_id` cascades when a contract is deleted.
+- `audit_events.contract_id` cascades when a contract is deleted, but permanent deletion copies the contract's full trail (chain hashes intact) to `audit_events_archive` first, along with a `contract.deleted` snapshot event.
+- `signer_challenges` and `signer_sessions` cascade with their contract.
 - Template fields live as JSON in `templates.fields_json`, not in a separate table.
 - `contract_values.field_id` has no foreign key because fields are JSON documents rather than rows.
 
@@ -203,13 +229,12 @@ These items are present in the code or build configuration.
 - Authentication is a single shared admin bearer token; there are no user accounts, roles, sessions, or per-clinic admin permissions.
 - `ADMIN_TOKEN` defaults to `change-me` if not configured.
 - Uploaded template PDFs are served as static files under `/uploads/` (the signer flow renders them). Generated signed PDFs under `/storage/` are now gated to admin/tailnet access (see [Access Control](#access-control)); they remain filename-addressable for admin download.
-- Signing tokens do not expire in the current schema or route logic.
 - There are no webhook callbacks to a patient-record system.
 - There is no multi-signer routing or reminder workflow.
-- Database migrations are handled inline in `src/db.ts`; only `contracts.archived_at` has an explicit additive migration check.
+- Database migrations are handled inline in `src/db.ts`; additive column checks exist for the evidence-hardening columns, and the audit hash chain backfills in `src/audit.ts`.
 - `templates.fields_json` stores field definitions as JSON, so individual fields cannot be referenced by database constraints.
-- Audit events are deleted when a contract is permanently deleted because of `ON DELETE CASCADE`.
-- The test suite currently covers only the exported list of supported field types in `src/validation.ts`; route, PDF, database, email, and archive behaviours are not covered by tests.
+- Rotating `ADMIN_TOKEN` invalidates in-flight signer OTP challenges and sessions (it keys the OTP HMAC); signers mid-flow would need to request a new code after a rotation.
+- The test suite covers field types, the IP gate, the audit hash chain, and the OTP helpers; route, PDF-stamping, email, and archive behaviours are exercised manually.
 - The signer UI does not restore an already captured signature image from saved values when reloading a partially completed contract.
 - The admin frontend depends on CDN-hosted PDF.js at runtime.
 - `create_cardinal_standard_room_template.sh` targets the external DocuSeal API, while this app is a separate self-hosted implementation. Keep that script distinct from this app's internal API flows.
@@ -249,7 +274,7 @@ Operational assumptions visible in code and config:
 
 The app is intentionally public — external signers open their signing link (`/sign.html?token=…`) from an email — but the admin UI and admin API must not be reachable from the public internet. An `onRequest` gate (`src/server.ts`, logic in `src/ip-allowlist.ts`) hides every non-signer route, returning `404` so the admin surface is invisible rather than merely forbidden. This is network-level defence in depth; the shared admin bearer token remains the application-level auth (per-user accounts are still future work).
 
-**Public paths (open from anywhere):** `/health`, `/sign.html`, `/sign.js`, `/styles.css`, `/api/sign/:token`, `/api/sign/:token/complete`, `/uploads/*` — everything the signer flow needs.
+**Public paths (open from anywhere):** `/health`, `/sign.html`, `/sign.js`, `/styles.css`, `/api/sign/:token` and everything the signer flow needs beneath it (`/complete`, `/otp`, `/viewed`), `/uploads/*`.
 
 **Admin paths (everything else):**
 

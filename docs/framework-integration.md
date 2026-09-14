@@ -68,12 +68,14 @@ POST /api/contracts
   "id": "ctr_...", "clinic_id": "...", "template_id": "...", "patient_record_id": "...",
   "patient_name": "...", "patient_age": "...", "payer_name": "...", "payer_email": "...",
   "status": "pending", "signing_token": "...", "signed_pdf_path": null,
-  "completed_at": null, "archived_at": null, "created_at": "...", "updated_at": "...",
+  "expires_at": "...", "completed_at": null, "archived_at": null, "created_at": "...", "updated_at": "...",
   "signingUrl": "https://contracts.docuseal.ink/sign.html?token=...",
   "email": { "sent": true, "...": "..." }
 }
 ```
-Persist `id` against your patient record. `signingUrl` is included for fallback/testing; in normal use the app emails it automatically (`email.sent`).
+Persist `id` against your patient record. `signingUrl` is included for fallback/testing; in normal use the app emails it automatically (`email.sent`). The link **expires after 30 days** (`expires_at`); if a payer lets one lapse, `POST /api/contracts/:id/extend {"days":30}` then `POST /api/contracts/:id/resend` re-opens and re-sends it.
+
+> The signer experience now includes an email verification step (a 6-digit code emailed to the payer before they may sign) and a mandatory consent checkbox — both automatic, nothing for the Framework to build.
 
 ### Track status
 ```http
@@ -82,11 +84,18 @@ GET /api/contracts?clinicId=clinic_cardinal&archived=true      # list archived
 ```
 A contract's `status` goes `pending` → `completed`; once completed, `signed_pdf_path` is set (serves at `https://contracts.docuseal.ink/storage/<basename>` — reachable from the Framework host). **There are no webhooks yet** — poll this endpoint for status changes, or store `id` and fetch on demand when the patient record is viewed.
 
-### Audit trail (optional)
+### Audit trail, integrity checks, link lifecycle (optional)
 ```http
 GET /api/contracts/:id/audit
-→ [{ "event_type": "contract.created|contract.opened|contract.completed|...", "actor": "system|signer|admin", "created_at": "...", ... }]
+→ [{ "event_type": "contract.created|contract.opened|document.viewed|identity.challenged|identity.verified|contract.completed|contract.copy_sent|...", "actor": "system|signer|admin", "created_at": "...", "prev_hash": "...", "hash": "...", ... }]
+
+GET /api/contracts/:id/verify     # re-hash the stored signed PDF vs the SHA-256 sealed at signing → { ok: true }
+GET /api/audit/verify             # walk the tamper-evident audit hash chain → { ok: true, eventCount: N }
+POST /api/contracts/:id/extend    # { "days": 30 } — fresh expiry window for a pending contract
+POST /api/contracts/:id/resend    # re-send the signing email (pending, unexpired only)
 ```
+
+On completion the contract row also carries `signed_pdf_sha256` and `content_sha256`, the signed PDF's certificate page records consent + signer IP + the content hash, and the signer is emailed a copy of the signed PDF.
 
 > Note: `contract.created` currently records `actor: "system"` (the API doesn't yet accept the acting user). If you need per-staff audit, flag it — that's a small app-side change.
 
@@ -116,7 +125,7 @@ CONTRACTS_TEMPLATES = {
 1. Staff opens a patient record in the Framework, clicks **Send contract** (choosing clinic/template — or defaulted by the patient's clinic).
 2. Framework server `POST /api/contracts` with the patient + payer details and the clinic's template id.
 3. Contracts app creates the contract (`status: pending`), pre-fills mapped fields, emails the signer via Resend.
-4. Signer opens `signingUrl`, fills signature/date, submits → app stamps the PDF, sets `status: completed`, stores `signed_pdf_path`.
+4. Signer opens `signingUrl`, verifies their email with a 6-digit code, views the document, ticks the consent statement, fills signature/date, submits → app stamps the PDF (with signing certificate + SHA-256 seals), sets `status: completed`, stores `signed_pdf_path`, and emails the signer their copy.
 5. Framework shows status (poll or fetch on view) and links the signed PDF once completed.
 
 ## 6. What to build

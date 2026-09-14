@@ -263,18 +263,27 @@ $('showArchivedContracts').addEventListener('change', loadContracts);
 async function loadContracts() {
   const archived = $('showArchivedContracts').checked;
   const rows = await api(`/api/contracts?clinicId=${encodeURIComponent(selectedClinicId())}&archived=${archived}`, { headers: headers() });
-  $('contractList').innerHTML = rows.map((row) => `
+  $('contractList').innerHTML = rows.map((row) => {
+    const subtitle = `${row.payer_email} · ${row.patient_record_id || 'No patient ID'}`
+      + (row.archived_at ? ` · Archived ${row.archived_at}` : '')
+      + (row.status === 'pending' && row.expires_at ? ` · Expires ${row.expires_at.slice(0, 10)}` : '');
+    const pending = row.status === 'pending' && !row.archived_at;
+    return `
     <div class="row">
-      <div><strong>${row.patient_name}</strong><br><span class="muted">${row.payer_email} · ${row.patient_record_id || 'No patient ID'}${row.archived_at ? ` · Archived ${row.archived_at}` : ''}</span></div>
+      <div><strong>${row.patient_name}</strong><br><span class="muted">${subtitle}</span></div>
       <div class="row-actions">
         <span class="status">${row.status}</span>
         ${row.signed_pdf_path ? ` <a href="/storage/${row.signed_pdf_path.split('/').pop()}" target="_blank">PDF</a>` : ''}
+        ${pending ? `<button class="secondary" data-resend-contract="${row.id}">Resend</button><button class="secondary" data-extend-contract="${row.id}">+30d</button>` : ''}
+        ${row.status === 'completed' ? `<button class="secondary" data-verify-contract="${row.id}">Verify</button>` : ''}
+        <button class="secondary" data-audit-contract="${row.id}">Audit</button>
         ${row.archived_at
           ? `<button class="secondary" data-restore-contract="${row.id}">Restore</button><button class="secondary danger" data-delete-contract="${row.id}">Remove</button>`
           : `<button class="secondary" data-archive-contract="${row.id}">Archive</button>`}
       </div>
     </div>
-  `).join('') || '<p class="muted">No contracts yet.</p>';
+  `;
+  }).join('') || '<p class="muted">No contracts yet.</p>';
 
   document.querySelectorAll('[data-archive-contract]').forEach((button) => button.addEventListener('click', async () => {
     await api(`/api/contracts/${button.dataset.archiveContract}/archive`, { method: 'POST', headers: headers() });
@@ -287,9 +296,45 @@ async function loadContracts() {
   }));
 
   document.querySelectorAll('[data-delete-contract]').forEach((button) => button.addEventListener('click', async () => {
-    if (!confirm('Permanently remove this archived contract and signed PDF?')) return;
+    if (!confirm('Permanently remove this archived contract and signed PDF? Its audit trail is retained in the archive.')) return;
     await api(`/api/contracts/${button.dataset.deleteContract}`, { method: 'DELETE', headers: headers() });
     await loadContracts();
+  }));
+
+  document.querySelectorAll('[data-resend-contract]').forEach((button) => button.addEventListener('click', async () => {
+    try {
+      const result = await api(`/api/contracts/${button.dataset.resendContract}/resend`, { method: 'POST', headers: headers() });
+      alert(result.email.sent ? 'Signing email sent.' : `Email not sent: ${result.email.reason || 'unknown reason'}`);
+    } catch (error) { alert(error.message); }
+  }));
+
+  document.querySelectorAll('[data-extend-contract]').forEach((button) => button.addEventListener('click', async () => {
+    try {
+      const row = await api(`/api/contracts/${button.dataset.extendContract}/extend`, { method: 'POST', headers: headers(), body: JSON.stringify({ days: 30 }) });
+      alert(`Link extended. New expiry: ${row.expires_at.slice(0, 10)}`);
+      await loadContracts();
+    } catch (error) { alert(error.message); }
+  }));
+
+  document.querySelectorAll('[data-verify-contract]').forEach((button) => button.addEventListener('click', async () => {
+    try {
+      const result = await api(`/api/contracts/${button.dataset.verifyContract}/verify`, { headers: headers() });
+      if (!result.checked) return alert(result.reason || 'Nothing to verify yet.');
+      alert(result.ok
+        ? `Integrity OK — stored PDF matches the SHA-256 sealed at signing.\n${result.actual}`
+        : `INTEGRITY FAILURE — the stored PDF no longer matches the sealed hash.\nStored: ${result.stored}\nActual: ${result.actual}${result.error ? `\n${result.error}` : ''}`);
+    } catch (error) { alert(error.message); }
+  }));
+
+  document.querySelectorAll('[data-audit-contract]').forEach((button) => button.addEventListener('click', async () => {
+    try {
+      const events = await api(`/api/contracts/${button.dataset.auditContract}/audit`, { headers: headers() });
+      const out = $('auditOutput');
+      out.classList.remove('hidden');
+      out.textContent = events.map((e) =>
+        `${e.created_at}  ${e.event_type.padEnd(22)} ${e.actor.padEnd(7)} ${e.ip || ''} ${e.data_json && e.data_json !== '{}' ? '\n    ' + e.data_json : ''}`
+      ).join('\n');
+    } catch (error) { alert(error.message); }
   }));
 }
 

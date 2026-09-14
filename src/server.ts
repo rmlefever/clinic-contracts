@@ -6,14 +6,16 @@ import fastifyStatic from '@fastify/static';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { nanoid } from 'nanoid';
 import { z } from 'zod';
 import { config } from './config.js';
 import { ipAllowed, isInternalIp, isPublicPath, hostFromUrl, requestHost } from './ip-allowlist.js';
-import { audit } from './audit.js';
+import { audit, verifyAuditChain, archiveContractAudit } from './audit.js';
 import { db, fieldsFor, type ClinicRecord, type ContractRecord, type TemplateRecord, type TemplateField } from './db.js';
-import { sendSigningEmail } from './email.js';
+import { sendSigningEmail, sendOtpEmail, sendCompletedEmail } from './email.js';
 import { stampSignedPdf } from './pdf.js';
+import { generateOtpCode, otpHash, constantTimeEqual, maskEmail } from './otp.js';
 
 fs.mkdirSync(config.uploadDir, { recursive: true });
 fs.mkdirSync(config.storageDir, { recursive: true });
@@ -56,8 +58,55 @@ function requireAdmin(request: { headers: Record<string, unknown> }) {
   }
 }
 
+// Zod validation failures (e.g. missing consent) are client errors, not 500s.
+app.setErrorHandler((error: Error & { issues?: { path: (string | number)[]; message: string }[] }, _request, reply) => {
+  if (error.name === 'ZodError') {
+    const issues = error.issues ?? [];
+    const message = issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ') || 'Invalid request body';
+    return reply.code(400).send({ statusCode: 400, error: 'Bad Request', message });
+  }
+  return reply.send(error);
+});
+
 function publicTemplate(t: TemplateRecord) {
   return { ...t, fields: fieldsFor(t), fields_json: undefined };
+}
+
+// --- Signer evidence: consent, identity verification, link expiry ----------
+
+/** The consent statement presented to the signer and recorded verbatim at completion. Never reword retroactively — bump the version instead. */
+export const CONSENT_STATEMENT = 'I confirm that I am the signer named above, that I have read the document shown, and that I consent to sign it electronically with the same effect as a handwritten signature.';
+export const CONSENT_VERSION = '1';
+
+const SESSION_COOKIE = 'signer_session';
+
+/** Email OTP is enforced whenever it can actually deliver codes (provider configured and not disabled). */
+function otpActive(): boolean {
+  return config.signerOtpEnabled && !!config.resendApiKey;
+}
+
+function signerSessionValid(request: { cookies: Record<string, string | undefined> }, contractId: string): boolean {
+  const token = request.cookies[SESSION_COOKIE];
+  if (!token) return false;
+  const row = db.prepare('SELECT * FROM signer_sessions WHERE token = ?').get(token) as { contract_id: string; expires_at: string } | undefined;
+  return !!row && row.contract_id === contractId && row.expires_at > new Date().toISOString();
+}
+
+function contractExpired(contract: ContractRecord): boolean {
+  return contract.status !== 'completed' && contract.expires_at !== null && contract.expires_at < new Date().toISOString();
+}
+
+/** Shared signer-route guards: 404 unknown, 410 archived, 410 expired (logged once). */
+function loadSignableContract(token: string): ContractRecord {
+  const contract = db.prepare('SELECT * FROM contracts WHERE signing_token = ?').get(token) as ContractRecord | undefined;
+  if (!contract) throw Object.assign(new Error('Contract not found'), { statusCode: 404 });
+  if (contract.archived_at) throw Object.assign(new Error('Contract has been archived'), { statusCode: 410 });
+  if (contractExpired(contract)) {
+    const already = db.prepare("SELECT 1 FROM audit_events WHERE contract_id = ? AND event_type = 'contract.expired'").get(contract.id);
+    if (!already) audit({ contractId: contract.id, actor: 'system', eventType: 'contract.expired', data: { expiresAt: contract.expires_at } });
+    throw Object.assign(new Error('This signing link has expired. Please contact the clinic to have it sent again.'), { statusCode: 410 });
+  }
+  return contract;
 }
 
 app.get('/health', async () => ({ ok: true }));
@@ -171,11 +220,12 @@ app.post('/api/contracts', async (request) => {
 
   const id = `ctr_${nanoid(12)}`;
   const token = nanoid(32);
+  const expiresAt = new Date(Date.now() + config.signingTokenDays * 86_400_000).toISOString();
   db.prepare(`
     INSERT INTO contracts
-      (id, clinic_id, template_id, patient_record_id, patient_name, patient_age, payer_name, payer_email, signing_token)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, body.clinicId, body.templateId, body.patientRecordId ?? null, body.patientName, body.patientAge ?? null, body.payerName, body.payerEmail, token);
+      (id, clinic_id, template_id, patient_record_id, patient_name, patient_age, payer_name, payer_email, signing_token, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, body.clinicId, body.templateId, body.patientRecordId ?? null, body.patientName, body.patientAge ?? null, body.payerName, body.payerEmail, token, expiresAt);
 
   const fields = fieldsFor(template);
   const values: Record<string, string> = {};
@@ -194,30 +244,107 @@ app.post('/api/contracts', async (request) => {
     from: clinic.email_from,
     signerName: body.payerName,
     patientName: body.patientName,
-    signingUrl
+    signingUrl,
+    clinicName: clinic.name
   });
-  audit({ contractId: id, actor: 'system', eventType: 'contract.created', data: { patientRecordId: body.patientRecordId, email } });
+  audit({ contractId: id, actor: 'system', eventType: 'contract.created', data: { patientRecordId: body.patientRecordId, email, expiresAt } });
   return { ...(db.prepare('SELECT * FROM contracts WHERE id = ?').get(id) as ContractRecord), signingUrl, email };
 });
 
 app.get('/api/sign/:token', async (request) => {
   const token = (request.params as { token: string }).token;
-  const contract = db.prepare('SELECT * FROM contracts WHERE signing_token = ?').get(token) as ContractRecord | undefined;
-  if (!contract) throw Object.assign(new Error('Contract not found'), { statusCode: 404 });
-  if (contract.archived_at) throw Object.assign(new Error('Contract has been archived'), { statusCode: 410 });
+  const contract = loadSignableContract(token);
   const template = db.prepare('SELECT * FROM templates WHERE id = ?').get(contract.template_id) as TemplateRecord;
   const values = db.prepare('SELECT field_id, value FROM contract_values WHERE contract_id = ?').all(contract.id) as { field_id: string; value: string }[];
+  const identityRequired = otpActive();
   audit({ contractId: contract.id, actor: 'signer', eventType: 'contract.opened', ip: request.ip, userAgent: request.headers['user-agent'], data: {} });
-  return { contract, template: publicTemplate(template), values: Object.fromEntries(values.map((v) => [v.field_id, v.value])) };
+  return {
+    contract,
+    template: publicTemplate(template),
+    values: Object.fromEntries(values.map((v) => [v.field_id, v.value])),
+    identity: { required: identityRequired, verified: !identityRequired || signerSessionValid(request, contract.id), emailMasked: maskEmail(contract.payer_email) },
+    consent: { text: CONSENT_STATEMENT, version: CONSENT_VERSION }
+  };
+});
+
+/** Record (once) that the signer actually rendered the contract document. */
+app.post('/api/sign/:token/viewed', async (request) => {
+  const token = (request.params as { token: string }).token;
+  const contract = loadSignableContract(token);
+  const already = db.prepare("SELECT 1 FROM audit_events WHERE contract_id = ? AND event_type = 'document.viewed'").get(contract.id);
+  if (!already) {
+    audit({ contractId: contract.id, actor: 'signer', eventType: 'document.viewed', ip: request.ip, userAgent: request.headers['user-agent'], data: {} });
+  }
+  return { ok: true };
+});
+
+/**
+ * Signer email verification.
+ *   POST /api/sign/:token/otp            -> send a code to the payer's email
+ *   POST /api/sign/:token/otp { code }   -> verify the code, grant a session cookie
+ */
+app.post('/api/sign/:token/otp', async (request, reply) => {
+  const token = (request.params as { token: string }).token;
+  const body = z.object({ code: z.string().trim().regex(/^\d{6}$/, 'Enter the 6-digit code').optional() }).parse(request.body ?? {});
+  const contract = loadSignableContract(token);
+  if (!otpActive()) return { enabled: false };
+
+  const clinic = db.prepare('SELECT * FROM clinics WHERE id = ?').get(contract.clinic_id) as ClinicRecord;
+
+  if (!body.code) {
+    const existing = db.prepare('SELECT * FROM signer_challenges WHERE contract_id = ?').get(contract.id) as { created_at: string } | undefined;
+    if (existing && Date.now() - new Date(existing.created_at).getTime() < config.otpResendThrottleSeconds * 1000) {
+      throw Object.assign(new Error(`Please wait ${config.otpResendThrottleSeconds} seconds between code requests`), { statusCode: 429 });
+    }
+    const code = generateOtpCode();
+    const expiresAt = new Date(Date.now() + config.otpTtlMinutes * 60_000).toISOString();
+    db.prepare(`
+      INSERT OR REPLACE INTO signer_challenges (contract_id, otp_hash, expires_at, attempts, created_at)
+      VALUES (?, ?, ?, 0, ?)
+    `).run(contract.id, otpHash(config.adminToken, contract.id, code), expiresAt, new Date().toISOString());
+    const email = await sendOtpEmail({ to: contract.payer_email, from: clinic.email_from, signerName: contract.payer_name, code });
+    audit({ contractId: contract.id, actor: 'system', eventType: 'identity.challenged', ip: request.ip, userAgent: request.headers['user-agent'], data: { sent: email.sent, to: maskEmail(contract.payer_email) } });
+    return { sent: email.sent, reason: email.sent ? undefined : email.reason };
+  }
+
+  const challenge = db.prepare('SELECT * FROM signer_challenges WHERE contract_id = ?').get(contract.id) as { otp_hash: string; expires_at: string; attempts: number } | undefined;
+  if (!challenge) throw Object.assign(new Error('Request a verification code first'), { statusCode: 400 });
+  if (challenge.expires_at < new Date().toISOString()) throw Object.assign(new Error('That code has expired — request a new one'), { statusCode: 400 });
+  if (challenge.attempts >= config.otpMaxAttempts) throw Object.assign(new Error('Too many incorrect attempts — request a new code'), { statusCode: 400 });
+
+  if (!constantTimeEqual(otpHash(config.adminToken, contract.id, body.code), challenge.otp_hash)) {
+    db.prepare('UPDATE signer_challenges SET attempts = attempts + 1 WHERE contract_id = ?').run(contract.id);
+    throw Object.assign(new Error('Incorrect code'), { statusCode: 400 });
+  }
+
+  const sessionToken = nanoid(32);
+  db.prepare(`
+    INSERT INTO signer_sessions (token, contract_id, expires_at)
+    VALUES (?, ?, ?)
+  `).run(sessionToken, contract.id, new Date(Date.now() + config.signerSessionHours * 3_600_000).toISOString());
+  reply.setCookie(SESSION_COOKIE, sessionToken, {
+    path: '/',
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: config.appUrl.startsWith('https://'),
+    maxAge: config.signerSessionHours * 3600
+  });
+  audit({ contractId: contract.id, actor: 'signer', eventType: 'identity.verified', ip: request.ip, userAgent: request.headers['user-agent'], data: { method: 'email-otp' } });
+  return { verified: true };
 });
 
 app.post('/api/sign/:token/complete', async (request) => {
   const token = (request.params as { token: string }).token;
-  const body = z.object({ values: z.record(z.string()) }).parse(request.body);
-  const contract = db.prepare('SELECT * FROM contracts WHERE signing_token = ?').get(token) as ContractRecord | undefined;
-  if (!contract) throw Object.assign(new Error('Contract not found'), { statusCode: 404 });
-  if (contract.archived_at) throw Object.assign(new Error('Contract has been archived'), { statusCode: 410 });
+  const body = z.object({
+    values: z.record(z.string()),
+    consentAccepted: z.boolean().refine((v) => v, { message: 'Consent to the electronic signing statement is required' })
+  }).parse(request.body);
+  const contract = loadSignableContract(token);
   if (contract.status === 'completed') throw Object.assign(new Error('Contract is already completed'), { statusCode: 400 });
+
+  if (otpActive() && !signerSessionValid(request, contract.id)) {
+    throw Object.assign(new Error('Verify your email before signing'), { statusCode: 403, code: 'identity_required' });
+  }
 
   const template = db.prepare('SELECT * FROM templates WHERE id = ?').get(contract.template_id) as TemplateRecord;
   const fields = fieldsFor(template);
@@ -227,20 +354,126 @@ app.post('/api/sign/:token/complete', async (request) => {
   const insertValue = db.prepare('INSERT OR REPLACE INTO contract_values (contract_id, field_id, value) VALUES (?, ?, ?)');
   for (const [fieldId, value] of Object.entries(body.values)) insertValue.run(contract.id, fieldId, value);
 
+  const viewed = db.prepare("SELECT created_at FROM audit_events WHERE contract_id = ? AND event_type = 'document.viewed' LIMIT 1").get(contract.id) as { created_at: string } | undefined;
+  const completedAt = new Date().toISOString();
   const signedPdfPath = path.join(config.storageDir, `${contract.id}.signed.pdf`);
-  await stampSignedPdf({ template, contract, fields: fields as TemplateField[], values: body.values, outputPath: signedPdfPath });
+  const { contentSha256, fileSha256 } = await stampSignedPdf({
+    template,
+    contract,
+    fields: fields as TemplateField[],
+    values: body.values,
+    outputPath: signedPdfPath,
+    consentText: CONSENT_STATEMENT,
+    consentVersion: CONSENT_VERSION,
+    signerIp: request.ip,
+    viewedAt: viewed?.created_at ?? null,
+    completedAt
+  });
   db.prepare(`
     UPDATE contracts
-    SET status = 'completed', signed_pdf_path = ?, completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+    SET status = 'completed', signed_pdf_path = ?, signed_pdf_sha256 = ?, content_sha256 = ?, completed_at = ?, updated_at = CURRENT_TIMESTAMP
     WHERE id = ?
-  `).run(signedPdfPath, contract.id);
-  audit({ contractId: contract.id, actor: 'signer', eventType: 'contract.completed', ip: request.ip, userAgent: request.headers['user-agent'], data: {} });
-  return { ok: true, signedPdfUrl: `/storage/${path.basename(signedPdfPath)}` };
+  `).run(signedPdfPath, fileSha256, contentSha256, completedAt, contract.id);
+  audit({
+    contractId: contract.id,
+    actor: 'signer',
+    eventType: 'contract.completed',
+    ip: request.ip,
+    userAgent: request.headers['user-agent'],
+    data: {
+      consentText: CONSENT_STATEMENT,
+      consentVersion: CONSENT_VERSION,
+      contentSha256,
+      signedPdfSha256: fileSha256,
+      identityMethod: otpActive() ? 'email-otp' : 'unverified'
+    }
+  });
+
+  // Send the signer their copy of the completed PDF.
+  const clinic = db.prepare('SELECT * FROM clinics WHERE id = ?').get(contract.clinic_id) as ClinicRecord;
+  let copy: { sent: boolean; reason?: string | null } = { sent: false, reason: 'RESEND_API_KEY is not configured' };
+  if (config.resendApiKey) {
+    const bytes = await fsp.readFile(signedPdfPath);
+    copy = await sendCompletedEmail({
+      to: contract.payer_email,
+      from: clinic.email_from,
+      signerName: contract.payer_name,
+      patientName: contract.patient_name,
+      pdfBase64: Buffer.from(bytes).toString('base64'),
+      pdfName: `${contract.id}.signed.pdf`
+    });
+  }
+  audit({ contractId: contract.id, actor: 'system', eventType: 'contract.copy_sent', data: { sent: copy.sent, reason: copy.sent ? null : copy.reason } });
+
+  return { ok: true, signedPdfUrl: `/storage/${path.basename(signedPdfPath)}`, copySent: copy.sent };
 });
 
 app.get('/api/contracts/:id/audit', async (request) => {
   requireAdmin(request);
   return db.prepare('SELECT * FROM audit_events WHERE contract_id = ? ORDER BY created_at ASC').all((request.params as { id: string }).id);
+});
+
+/** Re-hash the stored signed PDF and compare with the hash sealed at completion. */
+app.get('/api/contracts/:id/verify', async (request) => {
+  requireAdmin(request);
+  const id = (request.params as { id: string }).id;
+  const contract = db.prepare('SELECT * FROM contracts WHERE id = ?').get(id) as ContractRecord | undefined;
+  if (!contract) throw Object.assign(new Error('Contract not found'), { statusCode: 404 });
+  if (!contract.signed_pdf_path || !contract.signed_pdf_sha256) {
+    return { checked: false, reason: 'No sealed signed PDF for this contract' };
+  }
+  let bytes: Buffer;
+  try {
+    bytes = await fsp.readFile(contract.signed_pdf_path);
+  } catch {
+    return { checked: true, ok: false, error: 'Signed PDF file is missing from storage', stored: contract.signed_pdf_sha256, actual: null };
+  }
+  const actual = createHash('sha256').update(bytes).digest('hex');
+  return { checked: true, ok: actual === contract.signed_pdf_sha256, stored: contract.signed_pdf_sha256, actual };
+});
+
+/** Walk the full audit hash chain — detects any retroactive edit or deletion. */
+app.get('/api/audit/verify', async (request) => {
+  requireAdmin(request);
+  return verifyAuditChain();
+});
+
+/** Give a pending contract a fresh expiry window (e.g. the link expired and the payer still needs to sign). */
+app.post('/api/contracts/:id/extend', async (request) => {
+  requireAdmin(request);
+  const id = (request.params as { id: string }).id;
+  const days = z.number().int().min(1).max(365).catch(config.signingTokenDays).parse((request.body as { days?: number } | undefined)?.days);
+  const contract = db.prepare('SELECT * FROM contracts WHERE id = ?').get(id) as ContractRecord | undefined;
+  if (!contract) throw Object.assign(new Error('Contract not found'), { statusCode: 404 });
+  if (contract.status === 'completed') throw Object.assign(new Error('Cannot extend a completed contract'), { statusCode: 400 });
+
+  const expiresAt = new Date(Date.now() + days * 86_400_000).toISOString();
+  db.prepare('UPDATE contracts SET expires_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(expiresAt, id);
+  audit({ contractId: id, actor: 'admin', eventType: 'contract.extended', ip: request.ip, userAgent: request.headers['user-agent'], data: { days, expiresAt } });
+  return db.prepare('SELECT * FROM contracts WHERE id = ?').get(id) as ContractRecord;
+});
+
+/** Re-send the signing email for a pending, unexpired contract. */
+app.post('/api/contracts/:id/resend', async (request) => {
+  requireAdmin(request);
+  const id = (request.params as { id: string }).id;
+  const contract = db.prepare('SELECT * FROM contracts WHERE id = ?').get(id) as ContractRecord | undefined;
+  if (!contract) throw Object.assign(new Error('Contract not found'), { statusCode: 404 });
+  if (contract.archived_at) throw Object.assign(new Error('Contract has been archived'), { statusCode: 400 });
+  if (contract.status === 'completed') throw Object.assign(new Error('Contract is already completed'), { statusCode: 400 });
+  if (contractExpired(contract)) throw Object.assign(new Error('This link has expired — extend the contract first'), { statusCode: 400 });
+
+  const clinic = db.prepare('SELECT * FROM clinics WHERE id = ?').get(contract.clinic_id) as ClinicRecord;
+  const email = await sendSigningEmail({
+    to: contract.payer_email,
+    from: clinic.email_from,
+    signerName: contract.payer_name,
+    patientName: contract.patient_name,
+    signingUrl: `${config.appUrl}/sign.html?token=${contract.signing_token}`,
+    clinicName: clinic.name
+  });
+  audit({ contractId: id, actor: 'admin', eventType: 'contract.resent', ip: request.ip, userAgent: request.headers['user-agent'], data: { sent: email.sent, reason: email.sent ? null : email.reason } });
+  return { email };
 });
 
 app.post('/api/contracts/:id/archive', async (request) => {
@@ -277,6 +510,20 @@ app.delete('/api/contracts/:id', async (request) => {
   if (!contract.archived_at) {
     throw Object.assign(new Error('Archive the contract before permanent deletion'), { statusCode: 400 });
   }
+
+  // Preserve the evidence: a terminal event with a snapshot of what is being
+  // removed, then the full audit trail (with chain hashes) moves to the
+  // archive table before the cascade deletes the live rows.
+  const values = db.prepare('SELECT field_id, value FROM contract_values WHERE contract_id = ?').all(id) as { field_id: string; value: string }[];
+  audit({
+    contractId: id,
+    actor: 'admin',
+    eventType: 'contract.deleted',
+    ip: request.ip,
+    userAgent: request.headers['user-agent'],
+    data: { snapshot: contract, values, signedPdfDeleted: !!contract.signed_pdf_path }
+  });
+  archiveContractAudit(id);
 
   db.prepare('DELETE FROM contracts WHERE id = ?').run(id);
   if (contract.signed_pdf_path) {

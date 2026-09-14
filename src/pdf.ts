@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
-import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
+import { createHash } from 'node:crypto';
+import { PDFDocument, StandardFonts, rgb, type PDFFont } from 'pdf-lib';
 import type { TemplateField, TemplateRecord, ContractRecord } from './db.js';
 
 type Values = Record<string, string>;
@@ -10,13 +11,40 @@ function dataUrlToBytes(value: string): Uint8Array | null {
   return Buffer.from(match[1], 'base64');
 }
 
+function sha256(bytes: Uint8Array): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+/** Word-wrap for pdf-lib drawText (which does not wrap). */
+function wrapText(text: string, font: PDFFont, size: number, maxWidth: number): string[] {
+  const words = text.split(/\s+/).filter(Boolean);
+  const lines: string[] = [];
+  let line = '';
+  for (const word of words) {
+    const candidate = line ? `${line} ${word}` : word;
+    if (font.widthOfTextAtSize(candidate, size) <= maxWidth) {
+      line = candidate;
+    } else {
+      if (line) lines.push(line);
+      line = word;
+    }
+  }
+  if (line) lines.push(line);
+  return lines.length ? lines : [''];
+}
+
 export async function stampSignedPdf(input: {
   template: TemplateRecord;
   contract: ContractRecord;
   fields: TemplateField[];
   values: Values;
   outputPath: string;
-}) {
+  consentText: string;
+  consentVersion: string;
+  signerIp: string;
+  viewedAt: string | null;
+  completedAt: string;
+}): Promise<{ contentSha256: string; fileSha256: string }> {
   const pdfBytes = await fs.readFile(input.template.pdf_path);
   const pdfDoc = await PDFDocument.load(pdfBytes);
   const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
@@ -61,20 +89,54 @@ export async function stampSignedPdf(input: {
     });
   }
 
-  const signedPage = pdfDoc.addPage([612, 792]);
-  signedPage.drawText('Signing Certificate', { x: 72, y: 700, size: 20, font, color: rgb(0.05, 0.08, 0.1) });
-  signedPage.drawText(`Contract: ${input.contract.id}`, { x: 72, y: 660, size: 11, font });
-  signedPage.drawText(`Patient record: ${input.contract.patient_record_id ?? 'Not supplied'}`, { x: 72, y: 640, size: 11, font });
-  signedPage.drawText(`Signer: ${input.contract.payer_name} <${input.contract.payer_email}>`, { x: 72, y: 620, size: 11, font });
-  signedPage.drawText(`Completed: ${new Date().toISOString()}`, { x: 72, y: 600, size: 11, font });
-  signedPage.drawText('This certificate records the electronic signing event captured by Cardinal Contracts.', {
-    x: 72,
-    y: 560,
-    size: 10,
-    font,
-    maxWidth: 468
-  });
+  // Phase 1: seal the completed document content (the filled template without
+  // the certificate page) and hash it. This hash is printed on the certificate
+  // so the signed content is bound to it.
+  const contentBytes = await pdfDoc.save();
+  const contentSha256 = sha256(contentBytes);
+
+  // Phase 2: append the signing certificate, including the content hash.
+  const certDoc = await PDFDocument.load(contentBytes);
+  const certFont = await certDoc.embedFont(StandardFonts.Helvetica);
+  const courier = await certDoc.embedFont(StandardFonts.Courier);
+  const signedPage = certDoc.addPage([612, 792]);
+  const left = 72;
+  const maxWidth = 468;
+  let y = 710;
+
+  const line = (text: string, size = 11, f: PDFFont = certFont) => {
+    signedPage.drawText(text, { x: left, y, size, font: f, color: rgb(0.05, 0.08, 0.1), maxWidth });
+    y -= size + 6;
+  };
+  const para = (text: string, size = 10, f: PDFFont = certFont) => {
+    for (const l of wrapText(text, f, size, maxWidth)) line(l, size, f);
+  };
+
+  line('Signing Certificate', 20);
+  y -= 4;
+  line(`Contract: ${input.contract.id}`);
+  line(`Patient record: ${input.contract.patient_record_id ?? 'Not supplied'}`);
+  line(`Signer: ${input.contract.payer_name} <${input.contract.payer_email}>`);
+  line(`Signer IP at completion: ${input.signerIp}`);
+  line(`Document first viewed (UTC): ${input.viewedAt ?? 'Not recorded'}`);
+  line(`Completed (UTC): ${input.completedAt}`);
+  y -= 6;
+  line(`Signer consent (v${input.consentVersion}):`, 10);
+  para(`"${input.consentText}"`, 10);
+  line('The signer affirmatively accepted the statement above at completion.', 10);
+  y -= 6;
+  line('Document SHA-256 (content pages, excluding this certificate):', 10);
+  para(contentSha256, 9, courier);
+  y -= 2;
+  para('The SHA-256 of this complete file (including this certificate page) is recorded in the Cardinal Contracts audit record for this contract.', 9);
+  y -= 6;
+  para('This certificate records the electronic signing event captured by Cardinal Contracts.');
+
+  const finalBytes = await certDoc.save();
+  const fileSha256 = sha256(finalBytes);
 
   await fs.mkdir(input.outputPath.split('/').slice(0, -1).join('/'), { recursive: true });
-  await fs.writeFile(input.outputPath, await pdfDoc.save());
+  await fs.writeFile(input.outputPath, finalBytes);
+
+  return { contentSha256, fileSha256 };
 }
