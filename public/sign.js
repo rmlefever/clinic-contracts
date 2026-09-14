@@ -115,7 +115,11 @@ function renderForm() {
 function fieldHtml(field) {
   const value = state.values[field.id] || '';
   if (field.type === 'signature') {
-    return `<label>${field.label}<canvas class="sig-pad" data-signature="${field.id}"></canvas><button type="button" class="secondary" data-clear="${field.id}">Clear</button></label>`;
+    // NOT a <label>: a label's activation click goes to its first labelable
+    // descendant — the Clear button — and Safari fires that synthetic click
+    // on pointer-up even with preventDefault on pointerdown, wiping the
+    // signature the moment it is drawn. Keep the same look with a div + span.
+    return `<div class="sig-field"><span class="field-heading">${field.label}</span><canvas class="sig-pad" data-signature="${field.id}"></canvas><button type="button" class="secondary" data-clear="${field.id}">Clear</button></div>`;
   }
   if (field.type === 'checkbox') {
     return `<label><input type="checkbox" name="${field.id}" ${value ? 'checked' : ''}>${field.label}</label>`;
