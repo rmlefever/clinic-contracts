@@ -174,5 +174,5 @@ Expected: `status: "pending"`, a `signingUrl`, and `emailSent: true` (Resend is 
 - **PROMIS templates** not yet created (blocked on PDFs) — build config-driven so they slot in.
 - **No webhooks** — status is poll/fetch-on-demand for now.
 - **Per-staff audit** isn't passed through yet (`actor` is `system`); request it if needed.
-- **Signing tokens don't expire** (known tech debt) — acceptable for now.
+- Deploys: pushes to `rmlefever/clinic-contracts` main auto-deploy via the `dokploy-autodeploy` watcher (see `infra/dokploy-autodeploy/apps.json`).
 - The signer email's "from" is set per clinic (`clinics.email_from`), not per-send.
