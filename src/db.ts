@@ -122,6 +122,16 @@ if (!hasColumn('contracts', 'archived_at')) {
   db.prepare('ALTER TABLE contracts ADD COLUMN archived_at TEXT').run();
 }
 
+// --- Template management (2026-09) ----------------------------------------
+//
+// Page count of the uploaded PDF, stored on upload so the Framework's field
+// editor can size its page list without parsing the file. Nullable: rows that
+// predate the column are backfilled at startup by `backfillTemplatePageCounts`
+// (src/app.ts), and stay NULL if their PDF cannot be read.
+if (!hasColumn('templates', 'page_count')) {
+  db.prepare('ALTER TABLE templates ADD COLUMN page_count INTEGER').run();
+}
+
 // --- Evidence-hardening migrations (2026) ---------------------------------
 
 // Signing links now expire. Existing contracts get a deadline measured from
@@ -161,9 +171,14 @@ export type TemplateRecord = {
   pdf_path: string;
   fields_json: string;
   status: string;
+  page_count: number | null;
   created_at: string;
   updated_at: string;
 };
+
+/** Template lifecycle: draft -> active <-> inactive. Only `active` templates can be sent; `inactive` is the retire state (no deletion: signed contracts reference template_id). */
+export const TEMPLATE_STATUSES = ['draft', 'active', 'inactive'] as const;
+export type TemplateStatus = (typeof TEMPLATE_STATUSES)[number];
 
 export type AuditEventRecord = {
   id: string;

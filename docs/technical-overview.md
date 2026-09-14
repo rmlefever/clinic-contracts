@@ -6,9 +6,10 @@ This document describes the current implementation in this repository. It is bas
 
 Cardinal Contracts is a single Fastify application written in TypeScript.
 
-- `src/server.ts` owns the HTTP server, route registration, request validation, static file serving, and workflow orchestration.
-- `src/db.ts` opens the SQLite database with `better-sqlite3`, enables WAL mode and foreign keys, creates tables, inserts the default clinics, and exposes record types plus `fieldsFor()`.
-- `src/pdf.ts` generates completed PDFs by stamping values and signature images onto the original template PDF with `pdf-lib`, then appending a signing certificate page.
+- `src/app.ts` owns the Fastify instance: route registration, request validation, static file serving, workflow orchestration, and the startup backfill of template page counts. It exports `app` without listening, so tests drive it with `app.inject()`.
+- `src/server.ts` is the process entry point: it imports `app` and listens on `PORT`.
+- `src/db.ts` opens the SQLite database with `better-sqlite3`, enables WAL mode and foreign keys, creates tables, runs the additive column migrations, inserts the default clinics, and exposes record types plus `fieldsFor()`.
+- `src/pdf.ts` generates completed PDFs by stamping values and signature images onto the original template PDF with `pdf-lib`, then appending a signing certificate page. It also counts pages of an uploaded PDF (`countPdfPages`).
 - `src/email.ts` sends signing links, signer identity-verification codes, and completed-PDF copies through Resend when `RESEND_API_KEY` is configured.
 - `src/audit.ts` writes hash-chained audit events to SQLite (`hash = sha256(prev_hash + canonical_event_json)`), verifies the chain, and archives a contract's trail before permanent deletion.
 - `src/otp.ts` holds the pure helpers for signer email verification: code generation, HMAC hashing, constant-time comparison, and email masking.
@@ -33,7 +34,9 @@ The database bootstraps three clinics: `clinic_promis_hay_farm`, `clinic_promis_
 
 ### Templates
 
-Admins upload PDFs with `POST /api/templates/upload`. Uploaded files are stored as `<template-id>.pdf` in `UPLOAD_DIR`; the template row stores the absolute PDF path.
+Admins upload PDFs with `POST /api/templates/upload` (multipart: `file`, optional `name`, `clinicId`, `copyFieldsFrom`). The file is parsed with `pdf-lib` (400 if it is not a readable PDF) and its page count stored in `templates.page_count`. Uploaded files are stored as `<template-id>.pdf` in `UPLOAD_DIR`; the template row stores the absolute PDF path. A new template always starts as `draft`. `copyFieldsFrom` copies the field boxes of an existing template in the same clinic onto the new one, dropping any field whose page is beyond the new PDF, so a new version of a contract starts from the previous layout.
+
+Read routes: `GET /api/templates?clinicId=` (list), `GET /api/templates/:id` (one), `GET /api/templates/:id/pdf` (the original PDF streamed inline, admin-gated so a client app can proxy it to its own users), `GET /api/templates/:id/audit` (lifecycle events). All template responses carry `fields` (parsed from `fields_json`) and `pageCount`.
 
 Template fields are saved with `PUT /api/templates/:id/fields`. Supported field types are:
 
@@ -43,9 +46,13 @@ Template fields are saved with `PUT /api/templates/:id/fields`. Supported field 
 - `signature`
 - `checkbox`
 
-Each field stores normalized page coordinates (`x`, `y`, `w`, `h`) between 0 and 1, a 1-based page number, a required flag, and an optional source mapping. Source mappings currently supported by the API are `patientName`, `patientAge`, `payerName`, `payerEmail`, and `manual`.
+Each field stores normalized page coordinates, a 1-based page number, a required flag, and an optional source mapping. The coordinate model, as consumed by `src/pdf.ts`: `x` and `y` are the field's top-left corner as fractions (0–1) of the page width and height measured from the top-left of the page; `w` and `h` are fractions of the page width and height. `pdf-lib` uses a bottom-left origin, so the stamper computes `pdfY = pageHeight - y*pageHeight - h*pageHeight`. Fields placed on a page beyond `page_count` are rejected. Source mappings currently supported by the API are `patientName`, `patientAge`, `payerName`, `payerEmail`, and `manual`.
 
-Saving fields from the admin UI sets the template status to `active`. Only active templates can be used to create contracts.
+**Status lifecycle:** `draft` → `active` ⇄ `inactive`. Only `active` templates can be used to create contracts; `POST /api/contracts` refuses a draft or inactive template with 400 and says which. Activation requires at least one field. A template never returns to `draft`, and there is no delete route: contracts reference `template_id`, so `inactive` is the retire state.
+
+`PUT …/fields` accepts an optional `status` (`draft | active | inactive`). It defaults to `active`, which is what the built-in admin UI (`public/main.js`) relies on, except that an `inactive` template stays `inactive` unless a status is supplied. `PATCH /api/templates/:id` takes `{ name?, status? }` (at least one, zod-validated, no extra keys) for rename, activate, and retire.
+
+**Acting user.** Every admin route accepts an optional `X-Acting-User` header (free-text display string, sanitized and capped at 200 characters). It becomes the `actor` of the audit events the request writes and is repeated as `actingUser` in the event data; without it the actor is `admin` (or `system` for `contract.created`). Template lifecycle events are `template.uploaded`, `template.fields_saved`, `template.status_changed` (with `from`/`to`), and `template.renamed` (with `from`/`to`). They sit in the same hash chain as contract events with `contract_id = NULL` and `templateId` inside `data_json`; `GET /api/templates/:id/audit` selects them with `json_extract`.
 
 ### Contract Creation And Sending
 
@@ -90,7 +97,7 @@ The signer UI embeds the original uploaded PDF beside the generated form. The co
 
 ### Audit Log Integrity
 
-Every audit event is chained: `hash = sha256(prev_hash + canonical_json(event))` across all events in insertion order. `GET /api/audit/verify` walks the chain and reports the first inconsistency, making retroactive edits or deletions detectable. (Truncation of the chain's tail is not detectable from inside the table — the off-host daily backups provide that half of the guarantee.) The canonical JSON key order is fixed forever: reordering keys would invalidate every existing hash.
+Every audit event is chained: `hash = sha256(prev_hash + canonical_json(event))` across all events in insertion order. `GET /api/audit/verify` walks the chain and reports the first inconsistency, making retroactive edits or deletions detectable. (Truncation of the chain's tail is not detectable from inside the table — the off-host daily backups provide that half of the guarantee.) The canonical JSON key order is fixed forever: reordering keys would invalidate every existing hash. Template events reuse the existing columns (`contract_id` is nullable; the template id travels in `data_json`), so their introduction changed neither the schema of `audit_events` nor the canonical form; `tests/audit-compat.test.ts` seeds rows hashed by an independent copy of the pre-change canonical form and checks that the current code still reproduces and verifies them.
 
 ### Archive And Removal
 
@@ -113,10 +120,12 @@ The configured token defaults to `change-me` when `ADMIN_TOKEN` is not set.
 ### Template Setup Flow
 
 1. `GET /api/clinics`
-2. `POST /api/templates/upload`
-3. Admin UI renders the uploaded PDF through `/uploads/<file>.pdf`.
-4. `PUT /api/templates/:id/fields`
-5. `GET /api/templates?clinicId=<clinic-id>`
+2. `POST /api/templates/upload` (optionally `copyFieldsFrom=<previous version>`) — new template is `draft`
+3. Admin UI renders the uploaded PDF through `/uploads/<file>.pdf`; an external client proxies `GET /api/templates/:id/pdf` instead.
+4. `PUT /api/templates/:id/fields` (`status: "draft"` while editing, or omit it to activate on save)
+5. `PATCH /api/templates/:id` with `{ status: "active" }` to activate, `{ name }` to rename, `{ status: "inactive" }` to retire
+6. `GET /api/templates?clinicId=<clinic-id>` or `GET /api/templates/:id`
+7. `GET /api/templates/:id/audit` — lifecycle trail
 
 ### Contract Sending Flow
 
@@ -171,6 +180,7 @@ erDiagram
     text pdf_path
     text fields_json
     text status
+    int page_count
     text created_at
     text updated_at
   }
@@ -217,7 +227,8 @@ Relationship details:
 
 - `templates.clinic_id`, `contracts.clinic_id`, and `contracts.template_id` are foreign keys without cascade delete.
 - `contract_values.contract_id` cascades when a contract is deleted.
-- `audit_events.contract_id` cascades when a contract is deleted, but permanent deletion copies the contract's full trail (chain hashes intact) to `audit_events_archive` first, along with a `contract.deleted` snapshot event.
+- `audit_events.contract_id` cascades when a contract is deleted, but permanent deletion copies the contract's full trail (chain hashes intact) to `audit_events_archive` first, along with a `contract.deleted` snapshot event. Template events have `contract_id = NULL` and are unaffected by contract deletion.
+- `templates.page_count` is nullable; templates created before the column existed are backfilled from their PDF at startup and stay `NULL` if the file cannot be read.
 - `signer_challenges` and `signer_sessions` cascade with their contract.
 - Template fields live as JSON in `templates.fields_json`, not in a separate table.
 - `contract_values.field_id` has no foreign key because fields are JSON documents rather than rows.
@@ -231,10 +242,11 @@ These items are present in the code or build configuration.
 - Uploaded template PDFs are served as static files under `/uploads/` (the signer flow renders them). Generated signed PDFs under `/storage/` are now gated to admin/tailnet access (see [Access Control](#access-control)); they remain filename-addressable for admin download.
 - There are no webhook callbacks to a patient-record system.
 - There is no multi-signer routing or reminder workflow.
-- Database migrations are handled inline in `src/db.ts`; additive column checks exist for the evidence-hardening columns, and the audit hash chain backfills in `src/audit.ts`.
+- Database migrations are handled inline in `src/db.ts`; additive column checks exist for the evidence-hardening columns and `templates.page_count`, and the audit hash chain backfills in `src/audit.ts`.
 - `templates.fields_json` stores field definitions as JSON, so individual fields cannot be referenced by database constraints.
 - Rotating `ADMIN_TOKEN` invalidates in-flight signer OTP challenges and sessions (it keys the OTP HMAC); signers mid-flow would need to request a new code after a rotation.
-- The test suite covers field types, the IP gate, the audit hash chain, and the OTP helpers; route, PDF-stamping, email, and archive behaviours are exercised manually.
+- The test suite covers field types, the IP gate, the audit hash chain (including compatibility with pre-existing events), the OTP helpers, and the template management and contract-creation routes via `app.inject()`; PDF-stamping, email, signer-flow, and archive behaviours are exercised manually.
+- Template deletion is intentionally unsupported; an unused draft cannot be removed through the API, only retired.
 - The signer UI does not restore an already captured signature image from saved values when reloading a partially completed contract.
 - The admin frontend depends on CDN-hosted PDF.js at runtime.
 - `create_cardinal_standard_room_template.sh` targets the external DocuSeal API, while this app is a separate self-hosted implementation. Keep that script distinct from this app's internal API flows.
@@ -260,7 +272,7 @@ The compose service:
 - Sets `UPLOAD_DIR=/app/uploads`.
 - Sets `STORAGE_DIR=/app/storage`.
 - Mounts named volumes for `/app/data`, `/app/uploads`, and `/app/storage`.
-- Optionally accepts `APP_URL`, `RESEND_API_KEY`, and `EMAIL_FROM`.
+- Optionally accepts `APP_URL`, `RESEND_API_KEY`, `EMAIL_FROM`, and `LOG_LEVEL`.
 
 Operational assumptions visible in code and config:
 

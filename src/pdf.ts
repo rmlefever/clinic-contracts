@@ -33,6 +33,22 @@ function wrapText(text: string, font: PDFFont, size: number, maxWidth: number): 
   return lines.length ? lines : [''];
 }
 
+/**
+ * Parse an uploaded template PDF and return its page count. Throws if the bytes
+ * are not a loadable PDF (the caller turns that into a 400). Encrypted files
+ * are accepted so a protected-but-readable contract can still be a template.
+ */
+export async function countPdfPages(bytes: Uint8Array): Promise<number> {
+  const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+  return doc.getPageCount();
+}
+
+// Field coordinate model (shared with the admin UI and the Framework editor):
+//   page  1-based page number
+//   x, y  fraction (0-1) of the page width/height, measured from the TOP-LEFT
+//         corner of the page to the field's top-left corner
+//   w, h  fraction (0-1) of the page width/height
+// pdf-lib's origin is bottom-left, so y is flipped here when stamping.
 export async function stampSignedPdf(input: {
   template: TemplateRecord;
   contract: ContractRecord;

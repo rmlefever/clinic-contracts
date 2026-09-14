@@ -32,12 +32,92 @@ GET /api/clinics
 → [{ "id": "clinic_cardinal", "name": "Cardinal Clinic", "email_from": "...", "created_at": "..." }, ...]
 ```
 
+### Acting user (audit attribution)
+
+Every admin request may carry `X-Acting-User: <display string>` (for example `Jane Doe <jane@clinic>`, at most 200 characters; control characters are stripped). The value is recorded as the `actor` of every audit event the request writes, and also as `actingUser` inside the event data. Without the header the actor falls back to `admin` (or `system` for `contract.created`, the pre-existing value). Send it on every call the Framework makes on behalf of a logged-in staff member.
+
 ### Templates
+
 ```http
 GET /api/templates?clinicId=clinic_cardinal
-→ [{ "id": "tpl_...", "clinic_id": "...", "name": "...", "status": "active", "fields": [ ... ] }]
+→ [{ "id": "tpl_...", "clinic_id": "...", "name": "...", "status": "active", "pdf_path": "...", "pageCount": 5, "fields": [ ... ], "created_at": "...", "updated_at": "..." }]
+
+GET /api/templates/:id            # one template, same shape; 404 { message: "Template not found" }
+GET /api/templates/:id/pdf        # the original PDF, Content-Type: application/pdf, Content-Disposition: inline
+GET /api/templates/:id/audit      # lifecycle events for the template (see below), in chain order
 ```
-Only `status: "active"` templates can be sent. Each `field` has `{ id, label, type, required, source, page, x, y, w, h }`. `source` ∈ `patientName | patientAge | payerName | payerEmail | manual` — fields with a `source` are auto-filled at creation from the values you pass; `manual` fields are filled by the signer.
+
+Only `status: "active"` templates can be sent. Each `field` has `{ id, label, type, required, source, page, x, y, w, h }`. `type` ∈ `text | number | date | signature | checkbox`. `source` ∈ `patientName | patientAge | payerName | payerEmail | manual` — fields with a `source` are auto-filled at creation from the values you pass; `manual` fields are filled by the signer.
+
+`GET /api/templates/:id/pdf` is admin-gated like every other admin route, so the Framework proxies it to its own logged-in users rather than linking them to the public `/uploads/` root. `pageCount` may be `null` for a template whose PDF could not be read at startup.
+
+**Field coordinate model** (the Framework's visual editor must produce exactly this; it is what `src/pdf.ts` stamps with):
+
+| key | meaning |
+|---|---|
+| `page` | 1-based page number |
+| `x`, `y` | position of the field's **top-left corner** as a fraction (0–1) of the page **width** and **height**, measured from the **top-left** of the page |
+| `w`, `h` | width and height as fractions (0–1) of the page width and height (minimum 0.005) |
+
+A field at `{ page: 1, x: 0.5, y: 0.25, w: 0.2, h: 0.03 }` on a 595×842 pt page therefore starts 297.5 pt from the left edge and 210.5 pt down from the top, and is 119 pt wide by 25 pt tall. The server flips `y` into PDF space (bottom-left origin) when stamping. Saving a field whose `page` is beyond the PDF's last page is rejected with 400.
+
+#### Template status lifecycle
+
+```text
+draft ──activate──▶ active ◀──▶ inactive
+```
+
+- **draft**: freshly uploaded; cannot be sent. Fields can be saved without changing the status.
+- **active**: sendable. Activation (by `PATCH` or by `PUT …/fields`) requires at least one field; otherwise 400.
+- **inactive**: retired. Not sendable; can be reactivated. A template never returns to `draft`.
+- There is **no delete**: signed contracts reference `template_id`, so retiring is the end state. Upload a new version instead (see `copyFieldsFrom`).
+
+#### Upload a new template (or a new version of an existing one)
+
+```http
+POST /api/templates/upload
+Content-Type: multipart/form-data
+  file            the PDF (required)
+  name            display name (defaults to the uploaded filename)
+  clinicId        defaults to clinic_cardinal
+  copyFieldsFrom  optional: an existing template id in the same clinic whose field boxes seed the new template
+→ { ...template as above, "status": "draft", "pageCount": 5 }
+```
+
+Parts may appear in any order. The new template always starts as `draft`. With `copyFieldsFrom`, fields on pages beyond the new PDF's page count are dropped. Errors (400): not a readable PDF, unknown clinic, `copyFieldsFrom` unknown or in another clinic.
+
+#### Edit fields
+
+```http
+PUT /api/templates/:id/fields
+{ "fields": [ ... ], "status": "draft" | "active" | "inactive" }   # status optional
+→ template
+```
+
+`status` defaults to `active` (the built-in admin UI relies on that), with one exception: a template that is currently `inactive` stays `inactive` when no status is supplied. Send `status: "draft"` to save work in progress on a draft without activating it.
+
+#### Rename, activate, retire
+
+```http
+PATCH /api/templates/:id
+{ "name": "Cardinal Standard Room Contract - 2027" }        # rename
+{ "status": "active" }                                      # activate (needs ≥ 1 field)
+{ "status": "inactive" }                                    # retire
+→ template
+```
+
+At least one of `name`/`status` is required; unknown keys are rejected. A same-status request is a no-op.
+
+#### Template audit events
+
+Template lifecycle is recorded in the same tamper-evident chain as contract events, with `contract_id: null` and the template id in `data_json`:
+
+| event | data |
+|---|---|
+| `template.uploaded` | `templateId, clinicId, name, pageCount, fileSha256, copiedFieldsFrom, fieldCount, actingUser` |
+| `template.fields_saved` | `templateId, clinicId, fieldCount, fieldIds, status, actingUser` |
+| `template.status_changed` | `templateId, clinicId, from, to, actingUser` |
+| `template.renamed` | `templateId, clinicId, from, to, actingUser` |
 
 ### Create + send a contract (the main call)
 ```http
@@ -54,7 +134,7 @@ POST /api/contracts
 ```
 | field | required | notes |
 |---|---|---|
-| `templateId` | yes | must be `active` |
+| `templateId` | yes | must be `active` (a `draft` or `inactive` template is refused with 400 and a message saying which) |
 | `clinicId` | yes (defaults `clinic_cardinal`) | determines the "from" email |
 | `patientRecordId` | no | your patient id — **store this mapping** so you can list contracts per patient |
 | `patientName` | yes | pre-fills fields with `source: patientName` |
@@ -87,7 +167,7 @@ A contract's `status` goes `pending` → `completed`; once completed, `signed_pd
 ### Audit trail, integrity checks, link lifecycle (optional)
 ```http
 GET /api/contracts/:id/audit
-→ [{ "event_type": "contract.created|contract.opened|document.viewed|identity.challenged|identity.verified|contract.completed|contract.copy_sent|...", "actor": "system|signer|admin", "created_at": "...", "prev_hash": "...", "hash": "...", ... }]
+→ [{ "event_type": "contract.created|contract.opened|document.viewed|identity.challenged|identity.verified|contract.completed|contract.copy_sent|...", "actor": "<X-Acting-User value>|system|signer|admin", "created_at": "...", "prev_hash": "...", "hash": "...", ... }]
 
 GET /api/contracts/:id/evidence  # COMPLETE evidence bundle for patient-file archiving (see below)
 GET /api/contracts/:id/verify    # re-hash the stored signed PDF vs the SHA-256 sealed at signing → { ok: true }
@@ -110,7 +190,7 @@ One call returns everything a clinic app needs to archive the signing evidence o
 
 On completion the contract row also carries `signed_pdf_sha256` and `content_sha256`, the signed PDF's certificate page records consent + signer IP + the content hash, and the signer is emailed a copy of the signed PDF.
 
-> Note: `contract.created` currently records `actor: "system"` (the API doesn't yet accept the acting user). If you need per-staff audit, flag it — that's a small app-side change.
+`contract.created` and the admin contract actions (archive, restore, delete, extend, resend) record the `X-Acting-User` header as `actor` when it is sent; `contract.created` falls back to `system` without it, the others to `admin`.
 
 ## 4. Clinic & template state today
 
@@ -150,6 +230,7 @@ CONTRACTS_TEMPLATES = {
 4. **Status sync:** fetch the contract by `id` (filter your local table by `patient_record_id`) when the record is viewed, or a periodic poll. (Webhooks are a future enhancement — not available yet.)
 5. **Evidence archiving:** when a contract completes, pull `GET /api/contracts/:id/evidence` and store the signed PDF + evidence JSON on the patient file, recording `bundleSha256` and `signedPdfSha256` locally. Verify the bundle seal (`sha256` over the compact JSON of the bundle without `bundleSha256`) before trusting the copy. (The Cardinal Framework does this automatically in its refresh flow.)
 6. **Error handling:** surface email-send failures (`email.sent: false`) to staff so they can use the returned `signingUrl` manually.
+7. **Contract templates page** (admissions staff): list templates per clinic (`GET /api/templates?clinicId=`), upload a new version (`POST /api/templates/upload` with `copyFieldsFrom` set to the current template), render the PDF through a Framework route that proxies `GET /api/templates/:id/pdf`, edit field boxes visually using the coordinate model above and save with `PUT …/fields` (`status: "draft"` while editing), then `PATCH` to activate, rename, or retire. Send `X-Acting-User` on every call.
 
 ## 7. Worked example (run from the Framework host)
 
@@ -173,6 +254,6 @@ Expected: `status: "pending"`, a `signingUrl`, and `emailSent: true` (Resend is 
 
 - **PROMIS templates** not yet created (blocked on PDFs) — build config-driven so they slot in.
 - **No webhooks** — status is poll/fetch-on-demand for now.
-- **Per-staff audit** isn't passed through yet (`actor` is `system`); request it if needed.
+- **Per-staff audit** is available via the `X-Acting-User` header; the Framework should send it on every admin call.
 - Deploys: pushes to `rmlefever/clinic-contracts` main auto-deploy via the `dokploy-autodeploy` watcher (see `infra/dokploy-autodeploy/apps.json`).
 - The signer email's "from" is set per clinic (`clinics.email_from`), not per-send.

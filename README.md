@@ -27,7 +27,7 @@ npm run seed:clinics
 npm run dev
 ```
 
-Open `http://localhost:4321`. Set `ADMIN_TOKEN` in `.env`; API calls can use `Authorization: Bearer <token>`.
+Open `http://localhost:4321` (override with `PORT`). Set `ADMIN_TOKEN` in `.env`; API calls can use `Authorization: Bearer <token>`. Start the app from the repository root: the admin UI is served from `./public` relative to the working directory. `npm test` runs the suite against a throwaway database; `npm run build` type-checks and emits `dist/`.
 
 The app stores SQLite data in `DATABASE_PATH`, uploaded template PDFs in `UPLOAD_DIR`, and signed PDFs in `STORAGE_DIR`. The defaults from `.env.example` are local paths under the repository.
 
