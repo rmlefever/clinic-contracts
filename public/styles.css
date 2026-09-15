@@ -266,3 +266,14 @@ label {
   .shell, .designer, .sign-layout { grid-template-columns: 1fr; }
   .form-grid, .toolbar { grid-template-columns: 1fr; }
 }
+
+.status.declined { color: var(--accent-2); font-weight: 600; }
+
+.sig-tabs { display: flex; gap: 6px; }
+
+.sig-tabs .sig-tab.active {
+  background: var(--ink);
+  color: var(--paper);
+}
+
+.sig-type { display: grid; gap: 6px; }

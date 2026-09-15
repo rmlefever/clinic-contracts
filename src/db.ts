@@ -138,7 +138,7 @@ if (!hasColumn('templates', 'page_count')) {
 // their creation so stale pending links do not stay live forever.
 const tokenDays = Number(process.env.SIGNING_TOKEN_DAYS ?? 30);
 
-for (const column of ['signed_pdf_sha256', 'content_sha256', 'expires_at']) {
+for (const column of ['signed_pdf_sha256', 'content_sha256', 'expires_at', 'declined_at', 'decline_reason']) {
   if (!hasColumn('contracts', column)) {
     db.prepare(`ALTER TABLE contracts ADD COLUMN ${column} TEXT`).run();
   }
@@ -215,6 +215,8 @@ export type ContractRecord = {
   signed_pdf_sha256: string | null;
   content_sha256: string | null;
   completed_at: string | null;
+  declined_at: string | null;
+  decline_reason: string | null;
   expires_at: string | null;
   archived_at: string | null;
   created_at: string;

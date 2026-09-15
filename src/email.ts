@@ -37,6 +37,36 @@ export async function sendSigningEmail(input: {
   return { sent: true, id: result.data.id };
 }
 
+export async function sendReminderEmail(input: {
+  to: string;
+  from?: string | null;
+  signerName: string;
+  patientName: string;
+  signingUrl: string;
+}) {
+  if (!config.resendApiKey) return { sent: false, reason: 'RESEND_API_KEY is not configured' };
+
+  const resend = new Resend(config.resendApiKey);
+  const result = await resend.emails.send({
+    from: input.from || config.emailFrom,
+    to: input.to,
+    subject: `Reminder: contract for ${input.patientName} is awaiting your signature`,
+    html: `
+      <p>Dear ${escapeHtml(input.signerName)},</p>
+      <p>This is a friendly reminder that the contract for ${escapeHtml(input.patientName)} is still waiting for your signature.</p>
+      <p><a href="${input.signingUrl}">Open secure signing link</a></p>
+      <p>If you have already signed, please ignore this reminder.</p>
+      ${SAFETY_FOOTER}
+    `
+  });
+
+  if (result.error) {
+    return { sent: false, reason: result.error.message, error: result.error };
+  }
+
+  return { sent: true, id: result.data.id };
+}
+
 export async function sendOtpEmail(input: {
   to: string;
   from?: string | null;

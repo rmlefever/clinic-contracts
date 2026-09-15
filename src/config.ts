@@ -22,5 +22,14 @@ export const config = {
   otpTtlMinutes: Number(process.env.OTP_TTL_MINUTES ?? 10),
   otpResendThrottleSeconds: Number(process.env.OTP_RESEND_THROTTLE_SECONDS ?? 30),
   otpMaxAttempts: Number(process.env.OTP_MAX_ATTEMPTS ?? 5),
-  signerSessionHours: Number(process.env.SIGNER_SESSION_HOURS ?? 2)
+  signerSessionHours: Number(process.env.SIGNER_SESSION_HOURS ?? 2),
+  // Outbound webhook (single consumer: the Cardinal Framework). The URL and
+  // secret are operator env config ONLY — there is deliberately no API to set
+  // them, so no request can ever redirect the app at an arbitrary target.
+  webhookUrl: process.env.WEBHOOK_URL ?? '',
+  webhookSecret: process.env.WEBHOOK_SECRET ?? '',
+  // Automatic reminders for pending contracts (hourly in-app sweep).
+  remindersEnabled: (process.env.REMINDER_ENABLED ?? 'true') !== 'false',
+  reminderAfterDays: Number(process.env.REMINDER_AFTER_DAYS ?? 3),
+  reminderIntervalDays: Number(process.env.REMINDER_INTERVAL_DAYS ?? 7)
 };

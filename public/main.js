@@ -5,6 +5,11 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs
 const state = { clinics: [], templates: [], selected: null, pdf: null, page: 1, fields: [], scale: 1.2 };
 const $ = (id) => document.getElementById(id);
 
+/** HTML-escape before interpolating anything user-controlled into innerHTML (template names default to the uploaded filename, patient names come from records). */
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' })[char]);
+}
+
 $('adminToken').value = localStorage.getItem('cardinalAdminToken') || '';
 function saveAdminToken() {
   localStorage.setItem('cardinalAdminToken', $('adminToken').value);
@@ -60,7 +65,7 @@ document.querySelectorAll('.nav button').forEach((button) => {
 
 async function loadClinics() {
   state.clinics = await api('/api/clinics');
-  const options = state.clinics.map((clinic) => `<option value="${clinic.id}">${clinic.name}</option>`).join('');
+  const options = state.clinics.map((clinic) => `<option value="${clinic.id}">${esc(clinic.name)}</option>`).join('');
   $('clinicFilter').innerHTML = options;
   $('uploadClinic').innerHTML = options;
   $('sendClinic').innerHTML = options;
@@ -86,13 +91,13 @@ async function loadTemplates() {
   state.templates = await api(`/api/templates?clinicId=${encodeURIComponent(clinicId)}`, { headers: headers() });
   $('templateList').innerHTML = state.templates.map((t) => `
     <div class="row">
-      <div><strong>${t.name}</strong><br><span class="muted">${t.fields.length} fields</span></div>
+      <div><strong>${esc(t.name)}</strong><br><span class="muted">${t.fields.length} fields</span></div>
       <div><span class="status">${t.status}</span> <button class="secondary" data-edit="${t.id}">Edit</button></div>
     </div>
   `).join('') || '<p class="muted">No templates yet.</p>';
 
   $('templateSelect').innerHTML = state.templates.filter((t) => t.status === 'active')
-    .map((t) => `<option value="${t.id}">${t.name}</option>`).join('');
+    .map((t) => `<option value="${t.id}">${esc(t.name)}</option>`).join('');
 
   document.querySelectorAll('[data-edit]').forEach((button) => button.addEventListener('click', () => openDesigner(button.dataset.edit)));
 }
@@ -100,7 +105,7 @@ async function loadTemplates() {
 function loadClinicList() {
   $('clinicList').innerHTML = state.clinics.map((clinic) => `
     <div class="row">
-      <div><strong>${clinic.name}</strong><br><span class="muted">${clinic.email_from || 'No custom sender'} · ${clinic.id}</span></div>
+      <div><strong>${esc(clinic.name)}</strong><br><span class="muted">${esc(clinic.email_from || 'No custom sender')} · ${esc(clinic.id)}</span></div>
       <button class="secondary" data-delete-clinic="${clinic.id}">Remove</button>
     </div>
   `).join('') || '<p class="muted">No clinics yet.</p>';
@@ -178,13 +183,13 @@ function renderFields() {
     box.style.top = `${field.y * canvas.height}px`;
     box.style.width = `${field.w * canvas.width}px`;
     box.style.height = `${field.h * canvas.height}px`;
-    box.innerHTML = `<span class="field-label">${field.label}</span>`;
+    box.innerHTML = `<span class="field-label">${esc(field.label)}</span>`;
     box.addEventListener('pointerdown', (event) => dragField(event, field));
     stage.appendChild(box);
   }
   $('fieldList').innerHTML = state.fields.map((field) => `
     <div class="row">
-      <div><strong>${field.label}</strong><br><span class="muted">Page ${field.page} · ${field.type}</span></div>
+      <div><strong>${esc(field.label)}</strong><br><span class="muted">Page ${field.page} · ${field.type}${field.signatureStyle ? ' · ' + esc(field.signatureStyle) : ''}</span></div>
       <button class="secondary" data-delete="${field.id}">Remove</button>
     </div>
   `).join('');
@@ -216,7 +221,7 @@ function dragField(event, field) {
 $('addField').addEventListener('click', (event) => {
   event.preventDefault();
   const type = $('fieldType').value;
-  state.fields.push({
+  const field = {
     id: `fld_${crypto.randomUUID().slice(0, 8)}`,
     label: $('fieldLabel').value,
     type,
@@ -227,7 +232,9 @@ $('addField').addEventListener('click', (event) => {
     y: 0.72,
     w: type === 'signature' ? 0.34 : 0.28,
     h: type === 'signature' ? 0.06 : 0.032
-  });
+  };
+  if (type === 'signature') field.signatureStyle = $('fieldSigStyle').value;
+  state.fields.push(field);
   renderFields();
 });
 
@@ -264,15 +271,15 @@ async function loadContracts() {
   const archived = $('showArchivedContracts').checked;
   const rows = await api(`/api/contracts?clinicId=${encodeURIComponent(selectedClinicId())}&archived=${archived}`, { headers: headers() });
   $('contractList').innerHTML = rows.map((row) => {
-    const subtitle = `${row.payer_email} · ${row.patient_record_id || 'No patient ID'}`
+    const subtitle = `${esc(row.payer_email)} · ${esc(row.patient_record_id || 'No patient ID')}`
       + (row.archived_at ? ` · Archived ${row.archived_at}` : '')
       + (row.status === 'pending' && row.expires_at ? ` · Expires ${row.expires_at.slice(0, 10)}` : '');
     const pending = row.status === 'pending' && !row.archived_at;
     return `
     <div class="row">
-      <div><strong>${row.patient_name}</strong><br><span class="muted">${subtitle}</span></div>
+      <div><strong>${esc(row.patient_name)}</strong><br><span class="muted">${subtitle}</span></div>
       <div class="row-actions">
-        <span class="status">${row.status}</span>
+        <span class="status ${esc(row.status)}">${esc(row.status)}</span>
         ${row.signed_pdf_path ? ` <a href="/storage/${row.signed_pdf_path.split('/').pop()}" target="_blank">PDF</a>` : ''}
         ${pending ? `<button class="secondary" data-resend-contract="${row.id}">Resend</button><button class="secondary" data-extend-contract="${row.id}">+30d</button>` : ''}
         ${row.status === 'completed' ? `<button class="secondary" data-verify-contract="${row.id}">Verify</button>` : ''}

@@ -176,6 +176,23 @@ POST /api/contracts/:id/extend   # { "days": 30 } — fresh expiry window for a 
 POST /api/contracts/:id/resend   # re-send the signing email (pending, unexpired only)
 ```
 
+### Webhooks (Framework receives)
+
+The Contracts app can push lifecycle events instead of waiting for the Framework to poll. Operator-configured on the Contracts side via env only:
+
+```
+WEBHOOK_URL=https://promisframework.com/api/webhooks/contracts
+WEBHOOK_SECRET=<shared secret, also CONTRACTS_WEBHOOK_SECRET in Framework env>
+```
+
+Events: `contract.completed`, `contract.declined`, `contract.expired`. Body (no patient data):
+
+```json
+{ "event": "contract.completed", "contractId": "ctr_...", "occurredAt": "2026-09-14T12:00:00.000Z" }
+```
+
+Every delivery is signed: header `X-Contracts-Signature: {unix_ts}.{hmac_sha256(secret, ts + "." + rawBody)}`, rejected if older than 5 minutes. Verify the HMAC over the **raw** request body before trusting anything, and re-fetch details via the admin API — the payload is a change signal, never a data source. `declined` is a terminal contract status (the payer explicitly refused; reason is in the audit trail), distinct from `pending` (not yet signed) and `expired`.
+
 ### Evidence bundle (`GET /api/contracts/:id/evidence`)
 
 One call returns everything a clinic app needs to archive the signing evidence on the patient record, independently of the Contracts server:

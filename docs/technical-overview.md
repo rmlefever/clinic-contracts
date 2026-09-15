@@ -36,6 +36,8 @@ The database bootstraps three clinics: `clinic_promis_hay_farm`, `clinic_promis_
 
 Admins upload PDFs with `POST /api/templates/upload` (multipart: `file`, optional `name`, `clinicId`, `copyFieldsFrom`). The file is parsed with `pdf-lib` (400 if it is not a readable PDF) and its page count stored in `templates.page_count`. Uploaded files are stored as `<template-id>.pdf` in `UPLOAD_DIR`; the template row stores the absolute PDF path. A new template always starts as `draft`. `copyFieldsFrom` copies the field boxes of an existing template in the same clinic onto the new one, dropping any field whose page is beyond the new PDF, so a new version of a contract starts from the previous layout.
 
+**AcroForm auto-detection.** When no `copyFieldsFrom` is given and the uploaded PDF already carries fillable AcroForm fields, they are read (`src/detect-fields.ts`) and pre-placed as draft fields — text fields mapped by name hint to `date`/`number`, checkboxes to `checkbox`, and names matching patient/payer patterns to the matching prefill sources. The admin reviews the boxes in the designer and activates as usual. (Upstream DocuSeal additionally guesses fields from printed labels; we deliberately take only the reliable subset — real AcroForm widgets with real coordinates.)
+
 Read routes: `GET /api/templates?clinicId=` (list), `GET /api/templates/:id` (one), `GET /api/templates/:id/pdf` (the original PDF streamed inline, admin-gated so a client app can proxy it to its own users), `GET /api/templates/:id/audit` (lifecycle events). All template responses carry `fields` (parsed from `fields_json`) and `pageCount`.
 
 Template fields are saved with `PUT /api/templates/:id/fields`. Supported field types are:
@@ -72,7 +74,15 @@ If `RESEND_API_KEY` is present, the application sends the signer an email throug
 
 The public signer flow loads contract data with `GET /api/sign/:token`. Archived or expired contracts return HTTP 410. The route writes a `contract.opened` audit event every time it is called. The response also tells the signer UI whether email verification is required (`identity.required`), whether the current browser session has passed it (`identity.verified`), and carries the canonical consent statement and version presented at signing.
 
-**Link expiry.** Contracts carry `expires_at` (default 30 days, `SIGNING_TOKEN_DAYS`). An expired pending contract returns 410 with a `contract.expired` audit event (written once); admins can extend (`POST /api/contracts/:id/extend`) or re-send (`POST /api/contracts/:id/resend`) the link.
+**Link expiry.** Contracts carry `expires_at` (default 30 days, `SIGNING_TOKEN_DAYS`). An expired pending contract returns 410 with a `contract.expired` audit event (written once — by the signer route when the link is opened, or by the hourly background sweep when nobody ever opens it again); admins can extend (`POST /api/contracts/:id/extend`) or re-send (`POST /api/contracts/:id/resend`) the link.
+
+**Decline flow.** The signer page offers an explicit "I don't want to sign this document" action (`POST /api/sign/:token/decline`, optional recorded reason, same OTP identity gate as signing). A declined contract records `contract.declined` (with IP/UA, reason, identity method), fires the `contract.declined` webhook, and its link returns 410 — evidence the payer was asked and refused, distinct from never opening the link.
+
+**Typed signatures.** Signature fields can allow drawn, typed, or both (`signatureStyle: drawn|typed|both`, default both). A typed name is rendered onto a canvas in a handwriting style and captured exactly like a drawn one — the evidence (image stamped on the PDF) is identical.
+
+**Automatic reminders.** With `RESEND_API_KEY` configured, an hourly in-app sweep sends a reminder email (`contract.reminded`) for pending, unexpired contracts older than `REMINDER_AFTER_DAYS` (default 3), at most once per `REMINDER_INTERVAL_DAYS` (default 7). Disable with `REMINDER_ENABLED=false`. The same sweep writes expiry events and fires expiry webhooks for links that lapse without being opened again.
+
+**Webhooks.** One outbound consumer, operator-configured via env only (`WEBHOOK_URL` + `WEBHOOK_SECRET`): the Cardinal Framework. Events: `contract.completed`, `contract.declined`, `contract.expired`. Security model: no API can change the target (no SSRF pivot into the tailnet); payloads carry only event/contractId/occurredAt — never patient data; every delivery is signed `{unix_ts}.{hmac_sha256(secret, ts + '.' + body)}` in `X-Contracts-Signature` with a 5-minute replay window (scheme from upstream DocuSeal). Deliveries retry 3× and are audited (`webhook.sent`/`webhook.failed`). If webhooks ever gain multiple API-configurable consumers, a host allowlist becomes mandatory first.
 
 **Signer identity verification (email OTP).** When `RESEND_API_KEY` is configured (and `SIGNER_OTP_ENABLED` is not `false`), the signer must verify before completing:
 

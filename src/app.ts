@@ -13,9 +13,11 @@ import { config } from './config.js';
 import { ipAllowed, isInternalIp, isPublicPath, hostFromUrl, requestHost } from './ip-allowlist.js';
 import { audit, verifyAuditChain, archiveContractAudit } from './audit.js';
 import { db, fieldsFor, TEMPLATE_STATUSES, type ClinicRecord, type ContractRecord, type TemplateRecord, type TemplateField, type TemplateStatus } from './db.js';
-import { sendSigningEmail, sendOtpEmail, sendCompletedEmail } from './email.js';
+import { sendSigningEmail, sendOtpEmail, sendCompletedEmail, sendReminderEmail } from './email.js';
 import { stampSignedPdf, countPdfPages } from './pdf.js';
 import { generateOtpCode, otpHash, constantTimeEqual, maskEmail } from './otp.js';
+import { validatePdf, detectAcroFields } from './detect-fields.js';
+import { fireWebhook } from './webhook.js';
 
 // The Fastify application: every route lives here. `src/server.ts` imports this
 // and listens; tests import it and drive it with `app.inject()` without a port.
@@ -139,17 +141,23 @@ function signerSessionValid(request: { cookies: Record<string, string | undefine
 }
 
 function contractExpired(contract: ContractRecord): boolean {
-  return contract.status !== 'completed' && contract.expires_at !== null && contract.expires_at < new Date().toISOString();
+  return contract.status === 'pending' && contract.expires_at !== null && contract.expires_at < new Date().toISOString();
 }
 
-/** Shared signer-route guards: 404 unknown, 410 archived, 410 expired (logged once). */
+/** Write the one-time contract.expired audit event if not already present. */
+function markExpiredOnce(contract: ContractRecord) {
+  const already = db.prepare("SELECT 1 FROM audit_events WHERE contract_id = ? AND event_type = 'contract.expired'").get(contract.id);
+  if (!already) audit({ contractId: contract.id, actor: 'system', eventType: 'contract.expired', data: { expiresAt: contract.expires_at } });
+}
+
+/** Shared signer-route guards: 404 unknown, 410 archived/expired/declined (expiry logged once). */
 function loadSignableContract(token: string): ContractRecord {
   const contract = db.prepare('SELECT * FROM contracts WHERE signing_token = ?').get(token) as ContractRecord | undefined;
   if (!contract) throw Object.assign(new Error('Contract not found'), { statusCode: 404 });
   if (contract.archived_at) throw Object.assign(new Error('Contract has been archived'), { statusCode: 410 });
+  if (contract.status === 'declined') throw Object.assign(new Error('This contract was declined.'), { statusCode: 410 });
   if (contractExpired(contract)) {
-    const already = db.prepare("SELECT 1 FROM audit_events WHERE contract_id = ? AND event_type = 'contract.expired'").get(contract.id);
-    if (!already) audit({ contractId: contract.id, actor: 'system', eventType: 'contract.expired', data: { expiresAt: contract.expires_at } });
+    markExpiredOnce(contract);
     throw Object.assign(new Error('This signing link has expired. Please contact the clinic to have it sent again.'), { statusCode: 410 });
   }
   return contract;
@@ -259,6 +267,14 @@ app.post('/api/templates/upload', async (request) => {
     if (!source) throw badRequest(`copyFieldsFrom: template ${copyFrom} not found`);
     if (source.clinic_id !== clinicId) throw badRequest('copyFieldsFrom: template belongs to a different clinic');
     fields = fieldsFor(source).filter((field) => field.page <= pageCount);
+  } else {
+    // Nothing to copy: if the PDF carries AcroForm fields, pre-place them for
+    // the admin to review (template stays draft until fields are saved).
+    try {
+      fields = await detectAcroFields(file.bytes);
+    } catch {
+      fields = []; // unreadable form dictionary is not an upload error
+    }
   }
 
   const id = `tpl_${nanoid(10)}`;
@@ -294,6 +310,7 @@ const fieldSchema = z.object({
   type: z.enum(['text', 'number', 'date', 'signature', 'checkbox']),
   required: z.boolean().default(true),
   source: z.enum(['patientName', 'patientAge', 'payerName', 'payerEmail', 'manual']).optional(),
+  signatureStyle: z.enum(['drawn', 'typed', 'both']).optional(),
   page: z.number().int().positive(),
   x: z.number().min(0).max(1),
   y: z.number().min(0).max(1),
@@ -545,7 +562,9 @@ app.post('/api/sign/:token/complete', async (request) => {
     consentAccepted: z.boolean().refine((v) => v, { message: 'Consent to the electronic signing statement is required' })
   }).parse(request.body);
   const contract = loadSignableContract(token);
-  if (contract.status === 'completed') throw Object.assign(new Error('Contract is already completed'), { statusCode: 400 });
+  if (contract.status !== 'pending') {
+    throw Object.assign(new Error(contract.status === 'completed' ? 'Contract is already completed' : 'Contract is already ' + contract.status), { statusCode: 400 });
+  }
 
   if (otpActive() && !signerSessionValid(request, contract.id)) {
     throw Object.assign(new Error('Verify your email before signing'), { statusCode: 403, code: 'identity_required' });
@@ -610,7 +629,42 @@ app.post('/api/sign/:token/complete', async (request) => {
   }
   audit({ contractId: contract.id, actor: 'system', eventType: 'contract.copy_sent', data: { sent: copy.sent, reason: copy.sent ? null : copy.reason } });
 
+  void fireWebhook('contract.completed', contract.id);
+
   return { ok: true, signedPdfUrl: `/storage/${path.basename(signedPdfPath)}`, copySent: copy.sent };
+});
+
+/** Explicit refusal to sign — evidence the payer was asked and said no. */
+app.post('/api/sign/:token/decline', async (request) => {
+  const token = (request.params as { token: string }).token;
+  const body = z.object({ reason: z.string().max(1000).optional() }).parse(request.body ?? {});
+  const contract = loadSignableContract(token);
+  if (contract.status !== 'pending') {
+    throw Object.assign(new Error('Contract is already ' + contract.status), { statusCode: 400 });
+  }
+  // Declining is as consequential as signing: the same identity gate applies,
+  // so the audit trail records a verified refusal, not a link-holder's click.
+  if (otpActive() && !signerSessionValid(request, contract.id)) {
+    throw Object.assign(new Error('Verify your email before declining'), { statusCode: 403, code: 'identity_required' });
+  }
+
+  const declinedAt = new Date().toISOString();
+  db.prepare(`
+    UPDATE contracts
+    SET status = 'declined', declined_at = ?, decline_reason = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `).run(declinedAt, body.reason ?? null, contract.id);
+  audit({
+    contractId: contract.id,
+    actor: 'signer',
+    eventType: 'contract.declined',
+    ip: request.ip,
+    userAgent: request.headers['user-agent'],
+    data: { reason: body.reason ?? null, identityMethod: otpActive() ? 'email-otp' : 'unverified' }
+  });
+
+  void fireWebhook('contract.declined', contract.id);
+  return { ok: true };
 });
 
 app.get('/api/contracts/:id/audit', async (request) => {
@@ -790,3 +844,65 @@ app.delete('/api/contracts/:id', async (request) => {
 });
 
 await backfillTemplatePageCounts();
+
+// --- Background sweep: reminders + expiry webhooks --------------------------------
+//
+// Runs hourly (started by src/server.ts, NOT on import, so tests stay quiet).
+// Two jobs:
+//   1. newly-expired pending contracts get their contract.expired audit event
+//      (if a signer never opens the link again, the lazy route check would
+//      otherwise never fire) and a contract.expired webhook
+//   2. pending contracts older than REMINDER_AFTER_DAYS (default 3) that have
+//      not been reminded within REMINDER_INTERVAL_DAYS (default 7) get a
+//      reminder email, audited as contract.reminded
+
+export async function reminderAndExpirySweep(): Promise<{ expired: number; reminded: number }> {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  let expired = 0;
+  let reminded = 0;
+
+  const pending = db.prepare(`
+    SELECT * FROM contracts
+    WHERE status = 'pending' AND archived_at IS NULL
+  `).all() as ContractRecord[];
+
+  const lastReminded = new Map<string, string>();
+  for (const row of db.prepare(`
+    SELECT contract_id, MAX(created_at) AS last FROM audit_events
+    WHERE event_type = 'contract.reminded' GROUP BY contract_id
+  `).all() as { contract_id: string; last: string }[]) {
+    lastReminded.set(row.contract_id, row.last);
+  }
+
+  for (const contract of pending) {
+    if (contractExpired(contract)) {
+      const already = db.prepare("SELECT 1 FROM audit_events WHERE contract_id = ? AND event_type = 'contract.expired'").get(contract.id);
+      if (!already) {
+        markExpiredOnce(contract);
+        void fireWebhook('contract.expired', contract.id);
+        expired++;
+      }
+      continue;
+    }
+
+    if (!config.remindersEnabled || !config.resendApiKey) continue;
+    const ageDays = (now.getTime() - new Date(contract.created_at.includes('T') ? contract.created_at : contract.created_at.replace(' ', 'T') + 'Z').getTime()) / 86_400_000;
+    if (ageDays < config.reminderAfterDays) continue;
+    const last = lastReminded.get(contract.id);
+    if (last && (now.getTime() - new Date(last).getTime()) / 86_400_000 < config.reminderIntervalDays) continue;
+
+    const clinic = db.prepare('SELECT * FROM clinics WHERE id = ?').get(contract.clinic_id) as ClinicRecord;
+    const email = await sendReminderEmail({
+      to: contract.payer_email,
+      from: clinic.email_from,
+      signerName: contract.payer_name,
+      patientName: contract.patient_name,
+      signingUrl: `${config.appUrl}/sign.html?token=${contract.signing_token}`
+    });
+    audit({ contractId: contract.id, actor: 'system', eventType: 'contract.reminded', data: { sent: email.sent, reason: email.sent ? null : email.reason } });
+    reminded++;
+  }
+
+  return { expired, reminded };
+}
