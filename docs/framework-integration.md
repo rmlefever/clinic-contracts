@@ -181,7 +181,7 @@ POST /api/contracts/:id/resend   # re-send the signing email (pending, unexpired
 The Contracts app can push lifecycle events instead of waiting for the Framework to poll. Operator-configured on the Contracts side via env only:
 
 ```
-WEBHOOK_URL=https://promisframework.com/api/webhooks/contracts
+WEBHOOK_URL=https://cardinal.ts.miamiamspot.com/api/webhooks/contracts
 WEBHOOK_SECRET=<shared secret, also CONTRACTS_WEBHOOK_SECRET in Framework env>
 ```
 
