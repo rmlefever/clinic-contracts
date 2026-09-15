@@ -12,6 +12,11 @@ services:
       RESEND_API_KEY: ${RESEND_API_KEY:-}
       EMAIL_FROM: ${EMAIL_FROM:-DocuSeal <signing@docuseal.ink>}
       ADMIN_ALLOW_CIDR: ${ADMIN_ALLOW_CIDR:-}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      REMINDER_ENABLED: ${REMINDER_ENABLED:-true}
+      REMINDER_AFTER_DAYS: ${REMINDER_AFTER_DAYS:-3}
+      REMINDER_INTERVAL_DAYS: ${REMINDER_INTERVAL_DAYS:-7}
     volumes:
       - cardinal_contracts_data:/app/data
       - cardinal_contracts_uploads:/app/uploads
