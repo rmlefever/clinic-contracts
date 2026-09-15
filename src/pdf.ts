@@ -49,6 +49,30 @@ export async function countPdfPages(bytes: Uint8Array): Promise<number> {
 //         corner of the page to the field's top-left corner
 //   w, h  fraction (0-1) of the page width/height
 // pdf-lib's origin is bottom-left, so y is flipped here when stamping.
+
+/**
+ * Render a timestamp for the signing certificate in UK local time (GMT in
+ * winter, BST in summer), with the exact UTC instant kept in brackets so the
+ * certificate still matches the audit record byte for byte.
+ */
+export function certificateTime(iso: string | null | undefined): string {
+  if (!iso) return 'Not recorded';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return String(iso);
+  const local = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Europe/London',
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+    timeZoneName: 'short'
+  }).format(d);
+  return `${local} (${d.toISOString()} UTC)`;
+}
+
 export async function stampSignedPdf(input: {
   template: TemplateRecord;
   contract: ContractRecord;
@@ -134,8 +158,8 @@ export async function stampSignedPdf(input: {
   line(`Patient record: ${input.contract.patient_record_id ?? 'Not supplied'}`);
   line(`Signer: ${input.contract.payer_name} <${input.contract.payer_email}>`);
   line(`Signer IP at completion: ${input.signerIp}`);
-  line(`Document first viewed (UTC): ${input.viewedAt ?? 'Not recorded'}`);
-  line(`Completed (UTC): ${input.completedAt}`);
+  line(`Document first viewed: ${certificateTime(input.viewedAt)}`);
+  line(`Completed: ${certificateTime(input.completedAt)}`);
   y -= 6;
   line(`Signer consent (v${input.consentVersion}):`, 10);
   para(`"${input.consentText}"`, 10);
